@@ -5,8 +5,7 @@
 <br>
 
 <p align="center">
-  <img src="<img width="1437" height="1174" alt="image" src="https://github.com/user-attachments/assets/01d4027c-3210-4ab8-95ea-0ac4f10b605d" />
-" alt="BeatSync Engine Demo" width="800"/>
+<img width="1437" height="1174" alt="image" src="https://github.com/user-attachments/assets/d893717c-ccd5-4d40-96e9-b7380cee788a" />
   <br/>
   <em>Create dynamic, beat-matched videos in just a few clicks.</em>
 </p>
