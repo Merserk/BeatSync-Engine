@@ -20,7 +20,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.13-blue.svg" alt="Python 3.13">
-  <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT">
+  <img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License: AGPL-3.0">
   <img src="https://img.shields.io/badge/platform-Windows-lightgrey.svg" alt="Platform: Windows">
   <img src="https://img.shields.io/badge/CUDA-13.0-76B900?logo=nvidia" alt="CUDA Support">
 </p>
