@@ -5,7 +5,7 @@
 <br>
 
 <p align="center">
-<img width="1437" height="1174" alt="image" src="https://github.com/user-attachments/assets/d893717c-ccd5-4d40-96e9-b7380cee788a" />
+<img width="1418" height="1036" alt="image" src="https://github.com/user-attachments/assets/69542c8c-752c-4419-ab2f-18ac12300699" />
   <br/>
   <em>Create dynamic, beat-matched videos in just a few clicks.</em>
 </p>
