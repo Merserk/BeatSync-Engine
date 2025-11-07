@@ -68,8 +68,8 @@ BeatSync Engine is designed to be completely portable and requires no setup.
 *   **GPU (Optional but Recommended)**: An NVIDIA GPU is required for CUDA (audio) and NVENC (video) acceleration. The application will run in CPU-only mode otherwise.
 
 **Instructions:**
-1.  Go to the [**Releases**](https://github.com/BeatSync/beatsync-engine/releases) page.
-2.  Download the latest `BeatSync.Engine.vX.X.zip` file.
+1.  Go to the [**Releases**](https://github.com/Merserk/beatsync-engine/releases) page.
+2.  Download the latest `BeatSync.Engine.zip` file.
 3.  Unzip the archive to your desired location.
 4.  Run `run.bat` to start the application. Your browser will automatically open the user interface.
 
