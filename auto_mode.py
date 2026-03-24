@@ -130,49 +130,52 @@ def analyze_song_structure(y: np.ndarray, sr: int, beat_times: np.ndarray) -> Li
     Analyze song structure using spectral clustering.
     Identifies sections like intro, verse, chorus, bridge, outro.
     """
+    total_duration = len(y) / sr
+    feature_hop_length = 512
+
     try:
         # Compute chromagram for harmonic analysis
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512)
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=feature_hop_length)
         
         # Compute spectral features
-        spectral_contrast = librosa.feature.spectral_contrast(y=y, sr=sr, hop_length=512)
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=512)
+        spectral_contrast = librosa.feature.spectral_contrast(y=y, sr=sr, hop_length=feature_hop_length)
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=feature_hop_length)
         
         # Combine features
         features = np.vstack([chroma, spectral_contrast, mfcc])
-        
-        # Compute self-similarity matrix
-        rec_matrix = librosa.segment.recurrence_matrix(
-            features, 
-            mode='affinity',
-            metric='cosine',
-            bandwidth=3
-        )
-        
-        # Detect boundaries using distance_threshold instead of k
-        # This allows automatic determination of the number of sections
+        if features.shape[1] < 2:
+            raise ValueError("Not enough feature frames for structure clustering")
+
+        # Use a duration-based target section count that stays within the
+        # current librosa/sklearn agglomerative API requirements.
+        target_sections = int(round(total_duration / 20.0))
+        target_sections = max(2, min(8, target_sections))
+        target_sections = min(target_sections, features.shape[1])
+
         boundaries_frames = librosa.segment.agglomerative(
-            rec_matrix, 
-            k=None,
-            clusterer=None
+            features,
+            k=target_sections,
         )
-        
-        # If that fails, use a simpler approach
+
         if boundaries_frames is None or len(boundaries_frames) == 0:
             raise ValueError("Agglomerative clustering failed")
+
+        boundaries_frames = np.unique(boundaries_frames.astype(int))
+        if boundaries_frames[0] != 0:
+            boundaries_frames = np.concatenate([[0], boundaries_frames])
             
     except Exception as e:
         print(f"      ⚠️ Advanced structure analysis failed: {e}")
         print(f"      → Using fallback: onset-based segmentation")
         
         # Fallback: Use onset-based segmentation
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=512)
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=feature_hop_length)
         
         # Detect strong changes in onset strength
         onset_frames = librosa.onset.onset_detect(
             onset_envelope=onset_env,
             sr=sr,
-            hop_length=512,
+            hop_length=feature_hop_length,
             backtrack=False,
             pre_max=20,
             post_max=20,
@@ -183,7 +186,6 @@ def analyze_song_structure(y: np.ndarray, sr: int, beat_times: np.ndarray) -> Li
         )
         
         # Use every Nth onset as a boundary (to get ~4-8 sections)
-        total_duration = len(y) / sr
         target_sections = max(4, min(8, int(total_duration / 20)))  # 1 section per ~20 seconds
         
         if len(onset_frames) > target_sections:
@@ -195,11 +197,10 @@ def analyze_song_structure(y: np.ndarray, sr: int, beat_times: np.ndarray) -> Li
         # Always include start and end
         boundaries_frames = np.unique(np.concatenate([[0], boundaries_frames, [len(onset_env) - 1]]))
     
-    boundaries_times = librosa.frames_to_time(boundaries_frames, sr=sr, hop_length=512)
+    boundaries_times = librosa.frames_to_time(boundaries_frames, sr=sr, hop_length=feature_hop_length)
     
     # Create section information
     sections = []
-    total_duration = len(y) / sr
     
     for i in range(len(boundaries_times)):
         start_time = boundaries_times[i]

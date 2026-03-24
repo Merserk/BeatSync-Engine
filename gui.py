@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
+import base64
 import datetime
 import multiprocessing
 import os
+import re
 import shutil
 import subprocess
 import sys
+from urllib.parse import unquote, urlparse
 from pathlib import Path
 from typing import Dict, List, Tuple, TypeAlias
 
@@ -57,14 +60,16 @@ else:
     USING_PORTABLE_PYTHON = False
     print("Portable Python not found, using system Python")
 
-from ffmpeg_processing import DEFAULT_STANDARD_QUALITY, FFMPEG_FOUND, FFMPEG_PATH, check_nvenc_support, get_video_fps, normalize_quality_profile
+from ffmpeg_processing import DEFAULT_STANDARD_QUALITY, FFMPEG_FOUND, FFMPEG_PATH, check_nvenc_support, create_lossless_delivery_mp4, get_video_fps, normalize_quality_profile
 from video_processor import CPU_COUNT, MAX_THREADS, PARALLEL_WORKERS, create_music_video, estimate_threads_per_job, get_local_temp_dir, get_video_files
 from manual_mode import analyze_beats_manual, process_manual_intensity
 from smart_mode import analyze_beats_smart, get_gpu_info, get_preset_info, is_gpu_available, select_beats_smart, set_gpu_mode
 from auto_mode import analyze_beats_auto
 from ui_content import *
 
-NVENC_AVAILABLE = check_nvenc_support()
+GPU_RUNTIME_AVAILABLE = is_gpu_available()
+CPU_ONLY_MODE = not GPU_RUNTIME_AVAILABLE
+NVENC_AVAILABLE = GPU_RUNTIME_AVAILABLE and check_nvenc_support()
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -80,7 +85,7 @@ print(
         "Portable (bin/CUDA/v13.0)" if USING_PORTABLE_CUDA else "System (or not available)",
         librosa.__version__,
         "Portable (bin/ffmpeg/ffmpeg.exe)" if FFMPEG_FOUND else "System FFmpeg (portable not found)",
-        is_gpu_available(),
+        GPU_RUNTIME_AVAILABLE,
         get_gpu_info(),
         NVENC_AVAILABLE,
     )
@@ -92,6 +97,7 @@ print(f"{CONSOLE_SEPARATOR}\n")
 StatusResult: TypeAlias = Tuple[str, str, Dict]
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac"}
 STANDARD_QUALITY_LABELS = [("Fast", "fast"), ("Balanced", "balanced"), ("High", "high")]
+POWERSHELL_EXECUTABLE = shutil.which("powershell.exe") or shutil.which("powershell") or "powershell"
 
 
 def normalize_local_path(path_value: str) -> str | None:
@@ -100,8 +106,135 @@ def normalize_local_path(path_value: str) -> str | None:
     normalized = path_value.strip().strip('"').strip("'")
     if not normalized:
         return None
+
+    normalized = unquote(normalized)
+
+    parsed = urlparse(normalized)
+    if parsed.scheme and parsed.scheme.lower() == "file":
+        if parsed.netloc and parsed.path:
+            normalized = f"//{parsed.netloc}{parsed.path}"
+        else:
+            normalized = parsed.path or normalized
+
     normalized = os.path.expandvars(os.path.expanduser(normalized))
+    normalized = normalized.replace("/", os.sep)
+
+    # Browsers and toolkits sometimes send Windows paths with a leading slash:
+    # "/C:/Users/..." should still be treated as an absolute Windows path.
+    if re.match(r"^[\\/]+[A-Za-z]:[\\/]", normalized):
+        normalized = normalized.lstrip("\\/")
+
+    # If a malformed value already has the project path prepended before a
+    # drive-qualified Windows path, keep the last absolute drive path.
+    drive_matches = list(re.finditer(r"[A-Za-z]:[\\/]", normalized))
+    if len(drive_matches) > 1:
+        normalized = normalized[drive_matches[-1].start():]
+
+    if os.path.isabs(normalized):
+        return os.path.normpath(normalized)
+
     return os.path.abspath(normalized)
+
+
+def get_picker_start_dir(current_path: str | None, select_directory: bool) -> str:
+    normalized = normalize_local_path(current_path or "")
+    if normalized:
+        if select_directory:
+            if os.path.isdir(normalized):
+                return normalized
+        else:
+            if os.path.isfile(normalized):
+                parent_dir = os.path.dirname(normalized)
+                if parent_dir and os.path.isdir(parent_dir):
+                    return parent_dir
+            if os.path.isdir(normalized):
+                return normalized
+
+        parent_dir = os.path.dirname(normalized)
+        if parent_dir and os.path.isdir(parent_dir):
+            return parent_dir
+
+    home_dir = os.path.expanduser("~")
+    return home_dir if os.path.isdir(home_dir) else SCRIPT_DIR
+
+
+def escape_powershell_string(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def run_native_dialog(powershell_script: str) -> str | None:
+    if os.name != "nt":
+        raise gr.Error("Native path browsing is currently available on Windows only.")
+
+    encoded_script = base64.b64encode(powershell_script.encode("utf-16-le")).decode("ascii")
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    try:
+        result = subprocess.run(
+            [
+                POWERSHELL_EXECUTABLE,
+                "-NoProfile",
+                "-STA",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded_script,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+            creationflags=creationflags,
+        )
+    except FileNotFoundError as exc:
+        raise gr.Error("Windows PowerShell was not found on this system.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise gr.Error("The file picker did not respond in time.") from exc
+
+    if result.returncode != 0:
+        stderr_text = (result.stderr or "").strip()
+        raise gr.Error(f"Native file picker failed: {stderr_text or 'Unknown PowerShell error'}")
+
+    selected_path = (result.stdout or "").strip()
+    return selected_path or None
+
+
+def browse_for_audio_file(current_path: str) -> str:
+    start_dir = escape_powershell_string(get_picker_start_dir(current_path, select_directory=False))
+    powershell_script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.InitialDirectory = '{start_dir}'
+$dialog.Filter = 'Audio Files (*.mp3;*.wav;*.flac)|*.mp3;*.wav;*.flac|All Files (*.*)|*.*'
+$dialog.Title = 'Select Audio File'
+$dialog.Multiselect = $false
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    Write-Output $dialog.FileName
+}}
+"""
+    selected_path = run_native_dialog(powershell_script)
+    return normalize_local_path(selected_path or current_path or "") or ""
+
+
+def browse_for_video_folder(current_path: str) -> str:
+    start_dir = escape_powershell_string(get_picker_start_dir(current_path, select_directory=True))
+    powershell_script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'Select Video Folder'
+$dialog.SelectedPath = '{start_dir}'
+$dialog.ShowNewFolderButton = $false
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    Write-Output $dialog.SelectedPath
+}}
+"""
+    selected_path = run_native_dialog(powershell_script)
+    return normalize_local_path(selected_path or current_path or "") or ""
 
 
 def resolve_inputs(audio_path: str, video_folder: str, session_state: dict) -> tuple[str, List[str], dict]:
@@ -129,6 +262,10 @@ def resolve_inputs(audio_path: str, video_folder: str, session_state: dict) -> t
 
 def create_prores_preview(output_path: str, preview_path: str) -> str:
     attempts: List[tuple[str, List[str]]] = []
+    preferred_hwaccel = ["-hwaccel", "cuda"] if not CPU_ONLY_MODE else ["-hwaccel", "auto"]
+    cpu_fallback_hwaccels = [preferred_hwaccel]
+    if not CPU_ONLY_MODE:
+        cpu_fallback_hwaccels.append(["-hwaccel", "auto"])
 
     if NVENC_AVAILABLE:
         attempts.append(
@@ -136,8 +273,7 @@ def create_prores_preview(output_path: str, preview_path: str) -> str:
                 "NVENC",
                 [
                     FFMPEG_PATH,
-                    "-hwaccel",
-                    "cuda",
+                    *preferred_hwaccel,
                     "-i",
                     output_path,
                     "-c:v",
@@ -158,34 +294,43 @@ def create_prores_preview(output_path: str, preview_path: str) -> str:
             )
         )
 
-    attempts.append(
-        (
-            "CPU",
-            [
-                FFMPEG_PATH,
-                "-hwaccel",
-                "auto",
-                "-i",
-                output_path,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-y",
-                preview_path,
-            ],
+    for hwaccel_args in cpu_fallback_hwaccels:
+        attempt_name = "CPU (CUDA decode)" if hwaccel_args == ["-hwaccel", "cuda"] else "CPU"
+        attempts.append(
+            (
+                attempt_name,
+                [
+                    FFMPEG_PATH,
+                    *hwaccel_args,
+                    "-i",
+                    output_path,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "23",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-movflags",
+                    "+faststart",
+                    "-y",
+                    preview_path,
+                ],
+            )
         )
-    )
 
     for encoder_name, preview_cmd in attempts:
+        try:
+            if os.path.exists(preview_path):
+                os.remove(preview_path)
+        except OSError:
+            pass
+
         result = subprocess.run(preview_cmd, capture_output=True, text=True, timeout=180)
         if result.returncode == 0 and os.path.exists(preview_path):
             print(f"   Preview created for Gradio with {encoder_name}.")
@@ -199,18 +344,18 @@ def create_prores_preview(output_path: str, preview_path: str) -> str:
     return output_path
 
 
-def process_video(audio_path: str, video_folder: str, generation_mode: str, cut_intensity: float, smart_preset: str, output_filename: str, direction: str, playback_speed_str: str, timing_offset: float, parallel_workers: int, processing_mode: str, standard_quality: str, custom_fps: float, session_state: dict) -> StatusResult:
+def process_video(audio_path: str, video_folder: str, generation_mode: str, cut_intensity: float, smart_preset: str, output_filename: str, direction: str, playback_speed_str: str, timing_offset: float, parallel_workers: int, processing_mode: str, standard_quality: str, create_prores_delivery_mp4: bool, custom_fps: float, session_state: dict) -> StatusResult:
     try:
         session_state = session_state or {}
         resolved_audio_path, resolved_video_paths, session_state = resolve_inputs(
             audio_path, video_folder, session_state
         )
 
-        use_gpu = is_gpu_available()
+        use_gpu = GPU_RUNTIME_AVAILABLE
         set_gpu_mode(use_gpu)
 
         is_prores = processing_mode == "prores_proxy"
-        use_nvenc = processing_mode in ["h264_nvenc", "hevc_nvenc"] and NVENC_AVAILABLE
+        use_nvenc = processing_mode in ["h264_nvenc", "hevc_nvenc"] and NVENC_AVAILABLE and use_gpu
         gpu_encoder = processing_mode if use_nvenc else "none"
         quality = normalize_quality_profile(standard_quality)
         threads_per_job = estimate_threads_per_job(parallel_workers)
@@ -289,11 +434,30 @@ def process_video(audio_path: str, video_folder: str, generation_mode: str, cut_
         )
 
         preview_path = output_path
+        delivery_mp4_filename = None
+        delivery_mp4_error = None
+        preview_source_path = output_path
         if is_prores:
+            if create_prores_delivery_mp4:
+                print("Generating optional lossless MP4 delivery file...")
+                delivery_mp4_filename = f"{safe_name}_{timestamp}_delivery_lossless.mp4"
+                delivery_mp4_path = os.path.join(OUTPUT_DIR, delivery_mp4_filename)
+                try:
+                    preview_source_path = create_lossless_delivery_mp4(
+                        output_path,
+                        delivery_mp4_path,
+                        prefer_cuda_decode=not CPU_ONLY_MODE,
+                    )
+                    print(f"   Delivery MP4 created: {delivery_mp4_filename}")
+                except Exception as exc:
+                    delivery_mp4_filename = None
+                    delivery_mp4_error = str(exc)
+                    print(f"   Delivery MP4 creation failed: {delivery_mp4_error}")
+
             print("Generating H.264 preview for ProRes file...")
             preview_filename = f"{safe_name}_{timestamp}_preview.mp4"
             preview_path = os.path.join(OUTPUT_DIR, preview_filename)
-            preview_path = create_prores_preview(output_path, preview_path)
+            preview_path = create_prores_preview(preview_source_path, preview_path)
 
         gpu_info = f"GPU: {get_gpu_info()}" if use_gpu else "CPU"
         fps_info = f"{output_fps:.2f} FPS (custom)" if custom_fps else f"{output_fps:.2f} FPS (auto-detected)"
@@ -387,6 +551,12 @@ def process_video(audio_path: str, video_folder: str, generation_mode: str, cut_
         print(f"\n{CONSOLE_SEPARATOR}")
         print("PROCESS COMPLETE")
         print(f"{CONSOLE_SEPARATOR}\n")
+
+        if is_prores and delivery_mp4_filename:
+            status_msg += f"\nDelivery MP4: {delivery_mp4_filename}"
+        elif is_prores and create_prores_delivery_mp4 and delivery_mp4_error:
+            status_msg += f"\nDelivery MP4: Failed ({delivery_mp4_error})"
+
         return preview_path, status_msg, session_state
     except Exception as e:
         import traceback
@@ -418,9 +588,17 @@ def cleanup_on_startup():
 
 
 def create_ui() -> gr.Blocks:
-    python_status = "Portable (bin/python-3.13.9-embed-amd64/)" if USING_PORTABLE_PYTHON else "System Python"
-    cuda_status = "Portable (bin/CUDA/v13.0)" if USING_PORTABLE_CUDA else "System CUDA (or not available)"
-    ffmpeg_status = "Portable (bin/ffmpeg/)" if FFMPEG_FOUND else "System FFmpeg"
+    python_status = (
+        "✅ Portable (bin/python-3.13.9-embed-amd64/)"
+        if USING_PORTABLE_PYTHON
+        else "⚠️  System Python"
+    )
+    cuda_status = (
+        "✅ Portable (bin/CUDA/v13.0)"
+        if USING_PORTABLE_CUDA
+        else "⚠️  System CUDA (or not available)"
+    )
+    ffmpeg_status = "✅ Portable (bin/ffmpeg/)" if FFMPEG_FOUND else "⚠️  System FFmpeg"
     ready_threads = estimate_threads_per_job(PARALLEL_WORKERS)
 
     app = gr.Blocks(title="BeatSync Engine", theme=gr.themes.Soft())
@@ -432,14 +610,33 @@ def create_ui() -> gr.Blocks:
 
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### Input Paths")
-                audio_input = gr.Textbox(label=LABEL_AUDIO_FILE, info=INFO_AUDIO_FILE, placeholder=r"C:\Music\song.mp3")
-                video_input = gr.Textbox(label=LABEL_VIDEO_FOLDER, info=INFO_VIDEO_FOLDER, placeholder=r"D:\VideoClips")
+                gr.Markdown("### 📁 Input Files")
+                with gr.Row():
+                    audio_input = gr.Textbox(
+                        label=LABEL_AUDIO_FILE,
+                        info=INFO_AUDIO_FILE,
+                        placeholder=r"C:\Music\song.mp3",
+                        scale=5,
+                    )
+                    browse_audio_btn = gr.Button("Browse...", scale=1, min_width=120)
+
+                with gr.Row():
+                    video_input = gr.Textbox(
+                        label=LABEL_VIDEO_FOLDER,
+                        info=INFO_VIDEO_FOLDER,
+                        placeholder=r"D:\VideoClips",
+                        scale=5,
+                    )
+                    browse_video_btn = gr.Button("Browse...", scale=1, min_width=120)
 
                 with gr.Group():
-                    gr.Markdown("### Generation Mode")
+                    gr.Markdown("### 🎯 Generation Mode")
                     generation_mode = gr.Radio(
-                        choices=[("Auto Mode (Recommended)", "auto"), ("Smart Mode", "smart"), ("Manual Mode", "manual")],
+                        choices=[
+                            ("🤖 Auto Mode (Recommended)", "auto"),
+                            ("🧠 Smart Mode", "smart"),
+                            ("⚙️ Manual Mode", "manual"),
+                        ],
                         value="auto",
                         label=LABEL_GENERATION_MODE,
                         info=INFO_GENERATION_MODE,
@@ -472,14 +669,14 @@ def create_ui() -> gr.Blocks:
                         )
 
                 with gr.Group():
-                    gr.Markdown("### Video Settings")
+                    gr.Markdown("### ⚙️ Video Settings")
                     direction = gr.Radio(choices=["forward", "backward", "random"], value="forward", label=LABEL_DIRECTION, info=INFO_DIRECTION)
                     playback_speed = gr.Radio(choices=["Normal Speed", "Half Speed", "Double Speed"], value="Normal Speed", label=LABEL_PLAYBACK_SPEED, info=INFO_PLAYBACK_SPEED)
                     timing_offset = gr.Slider(minimum=-0.5, maximum=0.5, value=0.0, step=0.01, label=LABEL_TIMING_OFFSET, info=INFO_TIMING_OFFSET)
                     custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
 
                 with gr.Group():
-                    gr.Markdown("### Processing Mode")
+                    gr.Markdown("### 🎬 Processing Mode")
                     if NVENC_AVAILABLE:
                         processing_mode = gr.Radio(
                             choices=[("NVIDIA NVENC H.264", "h264_nvenc"), ("NVIDIA NVENC HEVC (H.265)", "hevc_nvenc"), ("CPU (H.264)", "cpu"), ("ProRes 422 Proxy (Precise Mode)", "prores_proxy")],
@@ -500,9 +697,15 @@ def create_ui() -> gr.Blocks:
                         label=LABEL_STANDARD_QUALITY,
                         info=INFO_STANDARD_QUALITY,
                     )
+                    prores_delivery_mp4 = gr.Checkbox(
+                        value=False,
+                        visible=False,
+                        label=LABEL_PRORES_DELIVERY_MP4,
+                        info=INFO_PRORES_DELIVERY_MP4,
+                    )
 
                 with gr.Group():
-                    gr.Markdown("### Performance Settings")
+                    gr.Markdown("### ⚙️ Performance Settings")
                     parallel_workers = gr.Slider(
                         minimum=1,
                         maximum=min(16, max(CPU_COUNT // 2, 4)),
@@ -513,13 +716,13 @@ def create_ui() -> gr.Blocks:
                     )
 
                 with gr.Group():
-                    gr.Markdown("### Output Settings")
+                    gr.Markdown("### 📁 Output Settings")
                     output_filename = gr.Textbox(value="music_video.mp4", label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
 
-                process_btn = gr.Button("Create Music Video", variant="primary", size="lg")
+                process_btn = gr.Button("🎬 Create Music Video", variant="primary", size="lg")
 
             with gr.Column(scale=1):
-                gr.Markdown("### Output")
+                gr.Markdown("### 📺 Output")
                 status_output = gr.Textbox(
                     label="Status",
                     interactive=False,
@@ -529,7 +732,7 @@ def create_ui() -> gr.Blocks:
                         ready_threads,
                         CPU_COUNT,
                         ffmpeg_status,
-                        is_gpu_available(),
+                        GPU_RUNTIME_AVAILABLE,
                         get_gpu_info(),
                         NVENC_AVAILABLE,
                     ),
@@ -545,7 +748,25 @@ def create_ui() -> gr.Blocks:
                 auto_group: gr.update(visible=mode == "auto"),
             }
 
+        def toggle_processing_options(mode):
+            return gr.update(visible=mode == "prores_proxy")
+
         generation_mode.change(fn=toggle_mode, inputs=[generation_mode], outputs=[manual_group, smart_group, auto_group])
+        processing_mode.change(
+            fn=toggle_processing_options,
+            inputs=[processing_mode],
+            outputs=[prores_delivery_mp4],
+        )
+        browse_audio_btn.click(
+            fn=browse_for_audio_file,
+            inputs=[audio_input],
+            outputs=[audio_input],
+        )
+        browse_video_btn.click(
+            fn=browse_for_video_folder,
+            inputs=[video_input],
+            outputs=[video_input],
+        )
 
         process_btn.click(
             fn=process_video,
@@ -562,6 +783,7 @@ def create_ui() -> gr.Blocks:
                 parallel_workers,
                 processing_mode,
                 standard_quality,
+                prores_delivery_mp4,
                 custom_fps,
                 session_state,
             ],
@@ -590,5 +812,4 @@ if __name__ == "__main__":
         share=False,
         inbrowser=True,
         show_error=True,
-        allowed_paths=[OUTPUT_DIR],
     )

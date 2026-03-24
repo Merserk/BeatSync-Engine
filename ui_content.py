@@ -43,7 +43,7 @@ SMART_PRESETS_CONFIG = {
 
 UI_TITLE = "BeatSync Engine"
 UI_MAIN_DESCRIPTION = """Create music videos that cut to the beat. Enter a local audio file path and
-a local video folder path to generate a video synchronized with your music's rhythm without duplicating source media."""
+a local video folder path to generate a video synchronized with your music's rhythm!"""
 
 MANUAL_MODE_DESCRIPTION = """**Manual Mode - Bass-Focused**
 - Simple bass frequency detection (20-200 Hz)
@@ -81,24 +81,50 @@ Fully automatic music analysis with adaptive beat detection:
 CONSOLE_SEPARATOR = "=" * 70
 
 
-def get_ready_status(python_status, cuda_status, max_threads, cpu_count, ffmpeg_status, gpu_available, gpu_info, nvenc_available):
-    gpu_line = f"GPU: {gpu_info}\n" if gpu_available else "CPU mode only\n"
-    nvenc_line = "NVENC: Enabled\n" if nvenc_available else ""
+def get_ready_status(
+    python_status,
+    cuda_status,
+    max_threads,
+    cpu_count,
+    ffmpeg_status,
+    gpu_available,
+    gpu_info,
+    nvenc_available,
+):
+    gpu_line = f"⚡ GPU: {gpu_info}\n" if gpu_available else "💻 CPU mode only\n"
+    nvenc_line = "🎬 NVENC: Enabled\n" if nvenc_available else ""
     return (
-        f"Ready to process!\n"
-        f"Python: {python_status}\n"
-        f"CUDA: {cuda_status}\n"
-        f"CPU: {max_threads}/{cpu_count} threads\n"
-        f"FFmpeg: {ffmpeg_status}\n"
+        f"✅ Ready to process!\n"
+        f"🐍 Python: {python_status}\n"
+        f"🎮 CUDA: {cuda_status}\n"
+        f"💻 CPU: {max_threads}/{cpu_count} threads\n"
+        f"📦 FFmpeg: {ffmpeg_status}\n"
         f"{gpu_line}{nvenc_line}"
-        f"Modes: Manual | Smart | Auto\n"
-        f"ProRes mode available\n"
-        f"Temp: Local folder only\n\n"
+        f"🎯 Modes: ⚙️ Manual | 🧠 Smart | 🤖 Auto\n"
+        f"🎯 ProRes mode available\n"
+        f"📁 Temp: Local folder only\n\n"
         f"Enter a local audio path and video folder to begin."
     )
 
 
-def get_success_message_smart(preset, preset_info, total_beats, tempo, total_cuts, python_str, cuda_str, max_threads, cpu_count, parallel_workers, gpu_info, encoder_info, codec_info, fps_info, filename, audio_info):
+def get_success_message_smart(
+    preset,
+    preset_info,
+    total_beats,
+    tempo,
+    total_cuts,
+    python_str,
+    cuda_str,
+    max_threads,
+    cpu_count,
+    parallel_workers,
+    gpu_info,
+    encoder_info,
+    codec_info,
+    fps_info,
+    filename,
+    audio_info,
+):
     return f"""Video created successfully!
 
 Smart Mode: {preset.upper()}
@@ -117,7 +143,24 @@ Export:
 Output: {filename}"""
 
 
-def get_success_message_manual_subdivided(total_cuts, subdivisions, total_beats, tempo, cut_intensity, python_str, cuda_str, max_threads, cpu_count, parallel_workers, gpu_info, encoder_info, codec_info, fps_info, filename, audio_info):
+def get_success_message_manual_subdivided(
+    total_cuts,
+    subdivisions,
+    total_beats,
+    tempo,
+    cut_intensity,
+    python_str,
+    cuda_str,
+    max_threads,
+    cpu_count,
+    parallel_workers,
+    gpu_info,
+    encoder_info,
+    codec_info,
+    fps_info,
+    filename,
+    audio_info,
+):
     return f"""Video created successfully!
 
 Manual Mode: {total_cuts} cuts
@@ -135,7 +178,24 @@ Export:
 Output: {filename}"""
 
 
-def get_success_message_manual_skipped(beats_used, cut_intensity_int, total_beats, tempo, cut_intensity, python_str, cuda_str, max_threads, cpu_count, parallel_workers, gpu_info, encoder_info, codec_info, fps_info, filename, audio_info):
+def get_success_message_manual_skipped(
+    beats_used,
+    cut_intensity_int,
+    total_beats,
+    tempo,
+    cut_intensity,
+    python_str,
+    cuda_str,
+    max_threads,
+    cpu_count,
+    parallel_workers,
+    gpu_info,
+    encoder_info,
+    codec_info,
+    fps_info,
+    filename,
+    audio_info,
+):
     return f"""Video created successfully!
 
 Manual Mode: {beats_used} cuts
@@ -153,7 +213,23 @@ Export:
 Output: {filename}"""
 
 
-def get_success_message_auto(total_cuts, total_beats, tempo, sections_info, python_str, cuda_str, max_threads, cpu_count, parallel_workers, gpu_info, encoder_info, codec_info, fps_info, filename, audio_info):
+def get_success_message_auto(
+    total_cuts,
+    total_beats,
+    tempo,
+    sections_info,
+    python_str,
+    cuda_str,
+    max_threads,
+    cpu_count,
+    parallel_workers,
+    gpu_info,
+    encoder_info,
+    codec_info,
+    fps_info,
+    filename,
+    audio_info,
+):
     section_summary = ""
     if sections_info:
         section_summary = "\n   - Sections analyzed:\n"
@@ -181,9 +257,28 @@ Export:
 Output: {filename}"""
 
 
-def get_startup_header(cpu_count, max_threads, parallel_workers, python_status, cuda_status, librosa_version, ffmpeg_status, gpu_available, gpu_info, nvenc_available):
-    gpu_line = f"   GPU: {gpu_info} (Auto-enabled)" if gpu_available else "   GPU: Not available (CPU only)"
-    nvenc_line = "   NVENC: Available (Auto-enabled)" if nvenc_available else "   NVENC: Not available"
+def get_startup_header(
+    cpu_count,
+    max_threads,
+    parallel_workers,
+    python_status,
+    cuda_status,
+    librosa_version,
+    ffmpeg_status,
+    gpu_available,
+    gpu_info,
+    nvenc_available,
+):
+    gpu_line = (
+        f"   GPU: {gpu_info} (Auto-enabled)"
+        if gpu_available
+        else "   GPU: Not available (CPU only)"
+    )
+    nvenc_line = (
+        "   NVENC: Available (Auto-enabled)"
+        if nvenc_available
+        else "   NVENC: Not available"
+    )
     return f"""{CONSOLE_SEPARATOR}
 BeatSync Engine
 {CONSOLE_SEPARATOR}
@@ -200,9 +295,13 @@ BeatSync Engine
 
 
 LABEL_AUDIO_FILE = "Audio File Path"
-INFO_AUDIO_FILE = "Absolute or relative local path to an MP3, WAV, or FLAC file"
+INFO_AUDIO_FILE = (
+    "Absolute or relative local path to an MP3, WAV, or FLAC file, or use Browse"
+)
 LABEL_VIDEO_FOLDER = "Video Folder Path"
-INFO_VIDEO_FOLDER = "Absolute or relative local folder path containing MP4/MKV clips"
+INFO_VIDEO_FOLDER = (
+    "Absolute or relative local folder path containing MP4/MKV clips, or use Browse"
+)
 LABEL_GENERATION_MODE = "Generation Mode"
 INFO_GENERATION_MODE = "Choose how beats are detected and selected"
 LABEL_CUT_INTENSITY = "Cut Intensity"
@@ -214,12 +313,16 @@ INFO_DIRECTION = "Forward / Backward / Random playback"
 LABEL_PLAYBACK_SPEED = "Playback Speed"
 INFO_PLAYBACK_SPEED = "Slow-motion / Normal / Fast-forward"
 LABEL_TIMING_OFFSET = "Timing Offset (seconds)"
-INFO_TIMING_OFFSET = "Fine-tune sync: negative=earlier, positive=later (applied to video playback)"
+INFO_TIMING_OFFSET = (
+    "Fine-tune sync: negative=earlier, positive=later (applied to video playback)"
+)
 LABEL_CUSTOM_FPS = "Custom FPS (Frame Rate)"
 INFO_CUSTOM_FPS = "Leave empty for auto-detect, or enter a value such as 24 / 30 / 60"
 LABEL_PROCESSING_MODE = "Processing Mode"
 LABEL_STANDARD_QUALITY = "Standard Export Quality"
 INFO_STANDARD_QUALITY = "Used for CPU/NVENC exports only. ProRes ignores this setting."
+LABEL_PRORES_DELIVERY_MP4 = "Also create delivery MP4 (Lossless)"
+INFO_PRORES_DELIVERY_MP4 = "ProRes only. Keeps the .mov master and also creates a lossless H.264/ALAC .mp4 delivery copy."
 LABEL_OUTPUT_FILENAME = "Output Filename"
 INFO_OUTPUT_FILENAME = "Timestamp added automatically (.mp4 or .mov)"
 
@@ -229,7 +332,9 @@ def get_processing_mode_info_nvenc():
 
 
 def get_processing_mode_info_cpu():
-    return "CPU: H.264 encoding with quality presets | ProRes: Precise lossless workflow"
+    return (
+        "CPU: H.264 encoding with quality presets | ProRes: Precise lossless workflow"
+    )
 
 
 def get_parallel_workers_label(recommended_workers):

@@ -26,6 +26,7 @@ The standard export path also rendered temp clips and then performed a full fina
 - Replaced GUI upload widgets with:
   - a local audio file path
   - a local video folder path
+- Added native Windows `Browse...` pickers that write the selected local path back into the text fields without reintroducing upload copies.
 - Added path normalization and validation for local input paths.
 - Removed BeatSync source-media copying into `temp/session_*`.
 - Stored resolved source paths in session state instead of copied files.
@@ -54,11 +55,18 @@ The standard export path also rendered temp clips and then performed a full fina
 ### Timing and Stability Fixes
 
 - Updated segment planning to use cumulative frame boundaries so final output duration remains frame-accurate across the full timeline.
+- Fixed auto-mode advanced song-structure analysis so it no longer fails against the current `librosa` / `scikit-learn` stack.
 - Improved GPU availability detection so the app falls back cleanly to CPU when CUDA is importable but not actually usable.
+- Changed NVENC detection from a simple encoder-list check to a real runtime probe at startup.
 - Improved ProRes preview generation to:
   - write previews to `output/`
-  - retry with CPU encoding if NVENC preview generation fails
+  - follow the boot-time CPU-only / GPU-mode decision
+  - retry through CPU-compatible fallback paths if GPU preview generation fails
   - only report preview success when the preview file actually exists
+- Added an optional ProRes secondary export path:
+  - `Also create delivery MP4 (Lossless)`
+  - keeps the `.mov` master
+  - creates a second lossless `.mp4` delivery file when enabled
 - Cleaned up runtime logging so the selected generation mode is reported correctly.
 
 ### Documentation
@@ -73,14 +81,17 @@ The standard export path also rendered temp clips and then performed a full fina
 - `smart_mode.py`
 - `ui_content.py`
 - `README.md`
+- `TEST_TODO.md`
 - `.gitignore`
 
 ## User-Facing Impact
 
 - The GUI now expects local file/folder paths instead of uploaded files.
+- The GUI now includes native Windows browse buttons for the local-path workflow.
 - Source media is used directly from its original location.
 - Standard exports should start faster, use less extra disk space, and avoid an unnecessary final video re-encode.
 - ProRes preview behavior is more reliable on systems where NVENC is present in FFmpeg but not usable at runtime.
+- ProRes mode can optionally create a second lossless MP4 delivery file while keeping the `.mov` master.
 
 ## Breaking Change
 
@@ -104,6 +115,7 @@ That gives a meaningful reduction in both disk usage and render time.
 - Portable Python compile pass completed successfully for the main modules.
 - Import checks completed successfully using the portable runtime.
 - `video_processor.py -h` completed successfully.
+- GUI construction (`create_ui()`) completed successfully after the later browse/runtime changes.
 
 ### Live Runtime Validation
 
@@ -115,6 +127,12 @@ Validated on a CPU-only test machine using local sample media:
 - GUI local-path CPU export: passed
 - GUI ProRes export: passed
 - GUI ProRes preview fallback path: passed
+
+Validated with targeted regression/probe scripts:
+
+- Auto-mode advanced structure analysis: passed after clustering fix
+- ProRes preview helper on CPU-only machine: passed
+- Optional lossless delivery MP4 helper: passed
 
 ### Behavior Verified
 
@@ -129,10 +147,12 @@ Validated on a CPU-only test machine using local sample media:
 - CUDA was not usable on the validation machine because the installed driver/runtime combination reported `cudaErrorInsufficientDriver`.
 - CPU paths were fully exercised.
 - GPU/NVENC full end-to-end validation is still needed on a compatible machine.
+- A workstation follow-up checklist now lives in `TEST_TODO.md`.
 
 ## Risks and Review Notes
 
 - The GUI input model changed substantially, so reviewers should focus on whether the project wants to remain local-desktop-first.
+- The native browse buttons are Windows-specific and intentionally align with the project's portable desktop usage.
 - The render pipeline changed materially in standard mode, so review should pay close attention to:
   - concat compatibility assumptions
   - final mux behavior
@@ -149,7 +169,6 @@ Validated on a CPU-only test machine using local sample media:
 ## Follow-Up Recommendations
 
 - Run a GPU/NVENC validation pass on a machine with compatible NVIDIA drivers.
-- Consider adding native file/folder picker UX if desired, while keeping the local-path model.
 - Consider additional documentation or release notes calling out the GUI workflow change.
 
 ## Reviewer Checklist

@@ -83,6 +83,7 @@ from smart_mode import analyze_beats_smart, get_gpu_info, is_gpu_available, list
 from auto_mode import analyze_beats_auto
 
 GPU_AVAILABLE = is_gpu_available()
+CPU_ONLY_MODE = not GPU_AVAILABLE
 cp = None
 
 warnings.filterwarnings("ignore", message=".*bytes wanted but 0 bytes read.*")
@@ -136,7 +137,7 @@ def get_chunk_size(max_workers: int) -> int:
     return min(120, max(24, workers * 6))
 
 
-NVENC_AVAILABLE = check_nvenc_support()
+NVENC_AVAILABLE = GPU_AVAILABLE and check_nvenc_support()
 print("NVIDIA NVENC: AVAILABLE - Hardware video encoding enabled" if NVENC_AVAILABLE else "NVIDIA NVENC: NOT AVAILABLE - Using CPU encoding only")
 
 

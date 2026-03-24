@@ -58,15 +58,45 @@ NVENC_QUALITY_SETTINGS: Dict[str, Dict[str, int | str]] = {
 
 
 def check_nvenc_support() -> bool:
-    """Check if FFmpeg supports NVIDIA NVENC hardware encoding."""
+    """Check if FFmpeg can actually use NVIDIA NVENC hardware encoding."""
     try:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
         result = subprocess.run(
             [FFMPEG_PATH, "-hide_banner", "-encoders"],
             capture_output=True,
             text=True,
             timeout=5,
+            creationflags=creationflags,
         )
-        return "h264_nvenc" in result.stdout
+        if "h264_nvenc" not in result.stdout:
+            return False
+
+        probe_cmd = [
+            FFMPEG_PATH,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:r=1:d=1",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "h264_nvenc",
+            "-f",
+            "null",
+            "-",
+        ]
+        probe_result = subprocess.run(
+            probe_cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=creationflags,
+        )
+        return probe_result.returncode == 0
     except Exception:
         return False
 
@@ -236,6 +266,65 @@ def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float | None 
 def is_mp4_path(path: str) -> bool:
     """Return True if the path uses an MP4-family container."""
     return os.path.splitext(path)[1].lower() in {".mp4", ".m4v"}
+
+
+def create_lossless_delivery_mp4(
+    input_file: str,
+    output_file: str,
+    prefer_cuda_decode: bool = False,
+) -> str:
+    """Create an optional lossless MP4 delivery file from a ProRes master."""
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    hwaccel_attempts = [["-hwaccel", "cuda"]] if prefer_cuda_decode else [["-hwaccel", "auto"]]
+    if prefer_cuda_decode:
+        hwaccel_attempts.append(["-hwaccel", "auto"])
+
+    last_error = "unknown FFmpeg error"
+
+    for hwaccel_args in hwaccel_attempts:
+        try:
+            if os.path.exists(output_file):
+                os.remove(output_file)
+        except OSError:
+            pass
+
+        cmd = [
+            FFMPEG_PATH,
+            *hwaccel_args,
+            "-i",
+            input_file,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "0",
+            "-pix_fmt",
+            "yuv422p10le",
+            "-profile:v",
+            "high422",
+            "-c:a",
+            "alac",
+            "-movflags",
+            "+faststart",
+            "-y",
+            output_file,
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            creationflags=creationflags,
+        )
+        if result.returncode == 0 and os.path.exists(output_file):
+            return output_file
+
+        stderr_tail = (result.stderr or "").strip().splitlines()
+        last_error = stderr_tail[-1] if stderr_tail else "unknown FFmpeg error"
+
+    raise Exception(f"Lossless MP4 creation failed: {last_error}")
 
 
 def build_standard_video_encode_args(
