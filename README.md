@@ -212,29 +212,6 @@ Run `python video_processor.py -h` for the full argument list.
 - Outputs are written to `output/`.
 - Temporary processing files are written to `temp/`.
 
-## Validation Notes
-
-- A workstation follow-up checklist for GPU/NVENC validation lives in `TEST_TODO.md`.
-
-## Workstation Status
-
-Status as of March 25, 2026:
-
-- Startup validation passed on the GTX 1080 Ti workstation: GPU detected, `CPU_ONLY_MODE=False`, and the NVENC startup probe passed.
-- The first workstation pass also confirmed the native `Browse...` buttons for audio files and video folders.
-- The original portable `CUDA 13.x` plus `cupy-cuda13x` stack failed during Auto Mode rhythm analysis on Pascal with a CuPy NVRTC architecture error.
-- The portable stack has now been moved to `bin/CUDA/v12.9` with `cupy-cuda12x==13.6.0`.
-- Workstation smoke tests now confirm CuPy JIT kernels and Manual, Smart, and Auto beat-analysis paths can run on GPU again under the CUDA 12 stack.
-- Full GUI export re-tests now pass on the downgraded stack for:
-  - Auto Mode with NVENC H.264
-  - Auto Mode with NVENC HEVC
-  - Smart Mode with NVENC
-  - Manual Mode with NVENC
-  - ProRes master export
-  - ProRes preview generation on the GPU-enabled workstation path
-- Mixed-aspect-ratio sources now render into the selected target frame with fit-and-pad instead of stretch.
-- HEVC mixed-source exports can still hit recoverable first-pass segment failures on some clips, but the retry chain now recovers those segments and the end-to-end export completes successfully.
-- The remaining workstation follow-up items are the unchecked entries in `TEST_TODO.md`, mainly around ProRes preview fallback, optional delivery MP4, longer-track sync checks, and custom-FPS coverage.
 
 ## License
 

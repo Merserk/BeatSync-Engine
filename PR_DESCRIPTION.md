@@ -27,7 +27,7 @@ The result is a branch that:
 The original workflow had two separate issues:
 
 1. The GUI and processing flow created unnecessary disk churn by staging media through uploads and then copying source files again into BeatSync temp folders.
-2. GPU validation on the GTX 1080 Ti workstation exposed that the portable `CUDA 13.x` plus `cupy-cuda13x` stack was not viable for Pascal GPU beat analysis, failing in CuPy/NVRTC during runtime kernel compilation.
+2. GPU validation on a GTX 1080 Ti workstation exposed that the portable `CUDA 13.x` plus `cupy-cuda13x` stack was not viable for Pascal GPU beat analysis, failing in CuPy/NVRTC during runtime kernel compilation.
 
 Those two threads ended up touching the same startup/runtime surface, so this PR documents both the workflow refactor and the workstation compatibility work that followed.
 
@@ -221,8 +221,6 @@ Validated on the GTX 1080 Ti workstation:
 
 These still remain open in `TEST_TODO.md`:
 
-- ProRes preview fallback when the preferred GPU preview path fails
-- `Also create delivery MP4 (Lossless)` plus playback validation of the generated delivery file
 - longer-track sync verification from start to finish
 - custom-FPS validation in both standard and ProRes modes
 

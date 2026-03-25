@@ -1,7 +1,3 @@
-# Workstation Test TODO
-
-Use this checklist on a machine with working NVIDIA drivers and CUDA/NVENC support.
-
 ## Priority Tests
 
 - [PASS] Confirm boot-time detection shows GPU available and `CPU_ONLY_MODE = False`.
@@ -18,11 +14,11 @@ Use this checklist on a machine with working NVIDIA drivers and CUDA/NVENC suppo
 
 - [PASS] Run a ProRes export and confirm the `.mov` master is created successfully.
 - [PASS] Confirm ProRes preview generation prefers CUDA/NVENC when GPU mode is available.
-- [ ] Confirm ProRes preview still falls back cleanly if the GPU preview path fails.
-- [ ] Test `Also create delivery MP4 (Lossless)` and confirm both files are produced:
+- [PASS] Confirm ProRes preview still falls back cleanly if the GPU preview path fails.
+- [PASS] Test `Also create delivery MP4 (Lossless)` and confirm both files are produced:
   - `.mov` master
   - `_delivery_lossless.mp4`
-- [ ] Open the generated lossless delivery MP4 and confirm playback is correct.
+- [PASS] Open the generated lossless delivery MP4 and confirm playback is correct.
 
 ## Behavior Checks
 
