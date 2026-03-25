@@ -2,22 +2,34 @@
 
 ## Suggested Title
 
-Local-path GUI workflow and render pipeline refactor to reduce disk usage and improve throughput
+Local-path workflow, render pipeline cleanup, and portable CUDA 12 workstation compatibility
 
 ## Summary
 
-This PR replaces the Gradio upload-based media flow with a local-path workflow and refactors the standard render pipeline to reduce duplicate disk usage, lower peak temp usage, and remove an unnecessary final video re-encode.
+This PR combines the local desktop workflow refactor with the follow-up GPU/runtime fixes discovered during workstation validation.
+
+The result is a branch that:
+
+- uses local file and folder paths instead of upload staging
+- avoids duplicating source media into BeatSync temp folders
+- scans nested video folders recursively
+- streamlines standard CPU/NVENC output assembly
+- improves timing stability and startup capability checks
+- adds safer GPU fallback behavior
+- adds custom target-resolution presets with aspect-ratio-safe fit-and-pad output
+- generates browser-friendly previews for non-browser-playable exports
+- hardens HEVC segment retries and chunk assembly so recoverable per-clip failures do not kill the export
+- makes the portable CUDA runtime version-aware instead of hard-coded to `v13.0`
+- restores a Pascal-friendly portable stack by moving the recommended CUDA line to `12.9.x`
 
 ## Problem
 
-The previous workflow had two major cost centers:
+The original workflow had two separate issues:
 
-- The GUI upload flow staged media into Gradio-managed files.
-- BeatSync then copied source media again into session temp folders under `temp/`.
+1. The GUI and processing flow created unnecessary disk churn by staging media through uploads and then copying source files again into BeatSync temp folders.
+2. GPU validation on the GTX 1080 Ti workstation exposed that the portable `CUDA 13.x` plus `cupy-cuda13x` stack was not viable for Pascal GPU beat analysis, failing in CuPy/NVRTC during runtime kernel compilation.
 
-For large source libraries, this could dramatically increase disk usage and startup time before rendering even began.
-
-The standard export path also rendered temp clips and then performed a full final video re-encode, which added extra processing time and another quality-loss step for standard delivery formats.
+Those two threads ended up touching the same startup/runtime surface, so this PR documents both the workflow refactor and the workstation compatibility work that followed.
 
 ## What Changed
 
@@ -26,98 +38,134 @@ The standard export path also rendered temp clips and then performed a full fina
 - Replaced GUI upload widgets with:
   - a local audio file path
   - a local video folder path
-- Added native Windows `Browse...` pickers that write the selected local path back into the text fields without reintroducing upload copies.
-- Added path normalization and validation for local input paths.
-- Removed BeatSync source-media copying into `temp/session_*`.
-- Stored resolved source paths in session state instead of copied files.
-- Configured Gradio to serve files directly from `output/`.
+- Added native Windows `Browse...` pickers for both inputs.
+- Normalized and validated local paths before processing.
+- Changed video-folder discovery to search `.mp4` and `.mkv` clips recursively.
+- Stopped copying source media into BeatSync session temp folders.
+- Stored resolved source paths in session state.
+- Configured Gradio to serve finished outputs directly from `output/`.
+- Added target-resolution presets in the GUI for common `16:9`, `21:9`, and `9:16` outputs.
 
 ### Standard Render Pipeline
 
-- Split the processing flow into clearer stages around input resolution, segment planning, and render/assembly.
-- Standard CPU/NVENC exports now:
-  - render segments directly at final quality
-  - concatenate chunk outputs with stream copy
-  - concatenate the final video with stream copy
-  - mux the audio track separately
+- Reworked standard CPU/NVENC exports around clearer planning, rendering, and assembly stages.
+- Standard exports now:
+  - render clips directly at final quality
+  - assemble chunk outputs with stream copy
+  - assemble the final video with stream copy
+  - mux audio separately
 - Added chunked assembly to reduce peak temp disk usage.
-- Added CPU thread budgeting so parallel workers do not oversubscribe all CPU threads per FFmpeg job.
-
-### Quality and CLI
-
-- Added standard export quality presets:
+- Added CPU thread budgeting so parallel FFmpeg jobs do not oversubscribe all logical cores.
+- Added standard quality presets:
   - `fast`
   - `balanced`
   - `high`
-- Exposed `--quality {fast,balanced,high}` in the CLI.
-- Added matching GUI quality controls for standard exports.
+- Exposed matching quality controls in both GUI and CLI.
 
-### Timing and Stability Fixes
+### Timing and Export Reliability
 
-- Updated segment planning to use cumulative frame boundaries so final output duration remains frame-accurate across the full timeline.
-- Fixed auto-mode advanced song-structure analysis so it no longer fails against the current `librosa` / `scikit-learn` stack.
-- Improved GPU availability detection so the app falls back cleanly to CPU when CUDA is importable but not actually usable.
-- Changed NVENC detection from a simple encoder-list check to a real runtime probe at startup.
-- Improved ProRes preview generation to:
-  - write previews to `output/`
-  - follow the boot-time CPU-only / GPU-mode decision
-  - retry through CPU-compatible fallback paths if GPU preview generation fails
-  - only report preview success when the preview file actually exists
-- Added an optional ProRes secondary export path:
-  - `Also create delivery MP4 (Lossless)`
-  - keeps the `.mov` master
-  - creates a second lossless `.mp4` delivery file when enabled
-- Cleaned up runtime logging so the selected generation mode is reported correctly.
+- Updated segment planning to use cumulative frame boundaries so long outputs stay aligned to the expected total duration.
+- Fixed Auto Mode advanced structure analysis against the current `librosa` / `scikit-learn` stack.
+- Improved mode/status logging so runtime reports match the actual selected processing path.
+- Switched resizing to fit-and-pad instead of stretch so mixed-aspect-ratio source clips keep their proportions.
+- Added browser-preview generation for non-browser-playable outputs so HEVC and ProRes finish cleanly in the GUI.
+- Added better Windows startup behavior by resolving an open local Gradio port instead of failing when `7860` is busy.
+- Added FFmpeg/ffprobe startup path setup so Gradio preview probing works with the portable FFmpeg bundle.
 
-### Documentation
+### GPU, NVENC, and Portable Runtime
 
-- Updated the README to describe the new local-path workflow, standard quality presets, current portable runtime expectations, and the revised processing pipeline.
+- Added stronger boot-time GPU runtime probing so CUDA being importable is no longer treated as proof that GPU processing will actually work.
+- Changed NVENC detection from a passive encoder-list check to a real runtime probe.
+- Added beat-analysis CPU fallback in Manual, Smart, and Auto modes when GPU analysis fails at runtime.
+- Added `analysis_device` reporting so the export/log layer can report whether analysis actually ran on GPU or CPU.
+- Introduced `runtime_env.py` as a shared helper for portable runtime discovery and environment setup.
+- Added version-aware portable CUDA discovery under `bin/CUDA/`.
+- Added the `BEATSYNC_CUDA_DIR` override for explicit CUDA toolkit selection.
+- Removed hard-coded `bin/CUDA/v13.0` assumptions from the app and launcher.
+- Simplified `run.bat` so Python owns CUDA discovery.
+- Shifted the recommended Pascal-compatible portable stack to:
+  - `CUDA 12.9.x`
+  - `cupy-cuda12x==13.6.0`
+
+### ProRes and Preview Paths
+
+- Improved ProRes preview generation so it:
+  - writes previews to `output/`
+  - follows the startup CPU-only vs GPU-mode decision
+  - retries through CPU-safe fallbacks when the GPU preview path fails
+  - only reports preview success when the preview file actually exists
+- Added an optional lossless delivery MP4 secondary export while keeping the `.mov` master.
+- Added the same browser-preview handling for standard non-browser-playable outputs such as HEVC delivery files.
+
+### Segment Retry and Assembly Hardening
+
+- Standard segment extraction now retries through safer fallback paths instead of failing immediately on the first NVENC issue.
+- Added validation so rendered segments and chunk outputs must contain a readable video stream before they are accepted.
+- Added chunk-assembly fallback from stream-copy concat to re-encode concat if stream-copy chunk assembly fails.
+- Reduced retry log spam by summarizing recovered segment retries per chunk while keeping real per-clip failures detailed.
+
+### Documentation and Validation Assets
+
+- Updated `README.md` to describe:
+  - the local-path workflow
+  - standard quality presets
+  - the revised processing pipeline
+  - portable CUDA auto-discovery
+  - the `BEATSYNC_CUDA_DIR` override
+  - the recommended Pascal-compatible CUDA 12 stack
+- Updated `TEST_TODO.md` with current workstation status, known failure history, and remaining GPU validation work.
 
 ## Files of Interest
 
 - `gui.py`
 - `video_processor.py`
 - `ffmpeg_processing.py`
+- `auto_mode.py`
 - `smart_mode.py`
-- `ui_content.py`
+- `manual_mode.py`
+- `runtime_env.py`
+- `run.bat`
 - `README.md`
 - `TEST_TODO.md`
 - `.gitignore`
 
 ## User-Facing Impact
 
-- The GUI now expects local file/folder paths instead of uploaded files.
-- The GUI now includes native Windows browse buttons for the local-path workflow.
-- Source media is used directly from its original location.
-- Standard exports should start faster, use less extra disk space, and avoid an unnecessary final video re-encode.
-- ProRes preview behavior is more reliable on systems where NVENC is present in FFmpeg but not usable at runtime.
-- ProRes mode can optionally create a second lossless MP4 delivery file while keeping the `.mov` master.
+- The GUI is now local-path based instead of upload based.
+- Users get native Windows browse buttons for selecting the audio file and video folder.
+- Source media is used in place instead of being duplicated into BeatSync temp folders.
+- Standard exports should start faster, use less extra disk space, and avoid an unnecessary final re-encode.
+- GPU/NVENC options only appear when the startup probe says they are truly usable.
+- On Pascal GPUs, the documented portable CUDA recommendation is now `12.9.x`, not `13.x`.
+- If a GPU analysis path fails unexpectedly, the app falls back cleanly to CPU instead of crashing.
 
 ## Breaking Change
 
 Yes.
 
-The GUI is now explicitly local-path based and assumes a local desktop workflow. This is a better fit for BeatSync's portable desktop usage, but it is not suitable for a remote-hosted or browser-only upload workflow without additional changes.
+The GUI is now explicitly built around a local desktop workflow. That is a better fit for BeatSync's portable Windows use case, but it is not equivalent to the previous upload-oriented model.
 
 ## Why This Approach
 
-This PR takes the larger refactor rather than a narrow "stop copying uploads" patch because the upload path itself was only part of the cost. The biggest practical win comes from addressing both sides of the problem:
+This branch favors a larger but coherent fix over a narrow one-off patch.
 
-- eliminate duplicated source-media staging
-- remove the extra final standard-video re-encode
+The disk-usage and throughput improvements required more than just removing one copy step, and the workstation validation work made it clear that the runtime layer also needed cleanup:
 
-That gives a meaningful reduction in both disk usage and render time.
+- local-path flow removes redundant file staging
+- standard assembly removes an unnecessary final re-encode
+- startup probing prevents false-positive GPU/NVENC availability
+- version-aware portable CUDA discovery avoids baking one toolkit version into the app
+- CUDA 12 restores a viable Pascal path for portable CuPy GPU analysis
 
 ## Testing Performed
 
 ### Static Validation
 
-- Portable Python compile pass completed successfully for the main modules.
+- Portable Python compile pass completed successfully for the touched Python modules.
 - Import checks completed successfully using the portable runtime.
-- `video_processor.py -h` completed successfully.
-- GUI construction (`create_ui()`) completed successfully after the later browse/runtime changes.
+- GUI startup import checks completed successfully after the runtime discovery changes.
 
-### Live Runtime Validation
+### CPU-Oriented Validation From Earlier In The Branch
 
 Validated on a CPU-only test machine using local sample media:
 
@@ -127,64 +175,104 @@ Validated on a CPU-only test machine using local sample media:
 - GUI local-path CPU export: passed
 - GUI ProRes export: passed
 - GUI ProRes preview fallback path: passed
-
-Validated with targeted regression/probe scripts:
-
-- Auto-mode advanced structure analysis: passed after clustering fix
-- ProRes preview helper on CPU-only machine: passed
 - Optional lossless delivery MP4 helper: passed
 
-### Behavior Verified
+### Workstation Validation On March 25, 2026
 
-- No source-media copies were created under `temp/session_*`.
-- Session temp directories were cleaned up after successful runs.
-- Standard export outputs had the expected audio/video streams and durations.
-- Auto-mode output duration landed exactly on the expected frame-aligned total after the cumulative-frame fix.
-- ProRes output produced `.mov` with H.264 preview written into `output/`.
+Validated on the GTX 1080 Ti workstation:
 
-## Environment Notes
+- GUI startup detection: passed
+  - GPU available
+  - `CPU_ONLY_MODE=False`
+  - NVENC startup probe passed
+- Native `Browse...` buttons:
+  - audio path selection passed
+  - video folder selection passed
+- Initial `Auto Mode` plus `NVIDIA NVENC H.264` run on the old `CUDA 13.x` stack:
+  - failed during CuPy/NVRTC kernel compilation on Pascal
+  - error signature matched `invalid value for --gpu-architecture (-arch)`
+- CPU fallback patch:
+  - prevented that failure from aborting analysis
+- Portable runtime downgrade:
+  - portable toolkit moved to `bin/CUDA/v12.9`
+  - portable Python package moved from `cupy-cuda13x` to `cupy-cuda12x==13.6.0`
+- Workstation GPU smoke tests after the downgrade:
+  - CuPy runtime reported `12090`
+  - CuPy JIT kernel probe passed
+  - Manual beat analysis reported `analysis_device=gpu`
+  - Smart beat analysis reported `analysis_device=gpu`
+  - Auto beat analysis reported `analysis_device=gpu`
+- Full GUI exports after the downgrade:
+  - `Auto Mode` plus `NVIDIA NVENC H.264`: passed
+  - `Auto Mode` plus `NVIDIA NVENC HEVC (H.265)`: passed
+  - `Smart Mode` with NVENC/HEVC: passed
+  - `Manual Mode` with NVENC/HEVC: passed
+  - ProRes master export: passed
+  - ProRes preview generation on the GPU-enabled workstation path: passed
+- Mixed-source HEVC export stability follow-up:
+  - initial per-segment NVENC failures were reproduced on some clips
+  - retry and validation hardening now recovers those segments without skipped-clip output in the successful end-to-end test
+- GUI polish follow-up:
+  - non-browser-playable outputs now generate an explicit preview before `PROCESS COMPLETE`
+  - the Windows Gradio socket-reset traceback after successful preview handling was suppressed
+  - the app now falls forward to the next open localhost port when `7860` is already in use
 
-- CUDA was not usable on the validation machine because the installed driver/runtime combination reported `cudaErrorInsufficientDriver`.
-- CPU paths were fully exercised.
-- GPU/NVENC full end-to-end validation is still needed on a compatible machine.
-- A workstation follow-up checklist now lives in `TEST_TODO.md`.
+## Remaining Validation
+
+These still remain open in `TEST_TODO.md`:
+
+- ProRes preview fallback when the preferred GPU preview path fails
+- `Also create delivery MP4 (Lossless)` plus playback validation of the generated delivery file
+- longer-track sync verification from start to finish
+- custom-FPS validation in both standard and ProRes modes
 
 ## Risks and Review Notes
 
-- The GUI input model changed substantially, so reviewers should focus on whether the project wants to remain local-desktop-first.
-- The native browse buttons are Windows-specific and intentionally align with the project's portable desktop usage.
-- The render pipeline changed materially in standard mode, so review should pay close attention to:
-  - concat compatibility assumptions
+- This is a broad PR. Review it as a workflow/runtime branch rather than a single isolated bugfix.
+- The GUI input model changed substantially, so reviewers should confirm the project wants to stay local-desktop-first.
+- The standard render pipeline changed materially, so reviewers should pay close attention to:
+  - concat assumptions
+  - chunk assembly
   - final mux behavior
   - thread allocation logic
   - frame-accuracy at segment boundaries
-- `ui_content.py` was simplified while updating the workflow text, so reviewers may want to compare any removed copy or labels they consider important.
+- Mixed-source HEVC exports are much more robust now, but some clips can still trigger recoverable first-pass NVENC segment failures before the fallback chain succeeds.
+- The runtime layer is better than before, but only portable path discovery is centralized today. Full capability-state centralization is still a follow-up refactor.
+- The README and checklist now reflect a Pascal-friendly CUDA 12 recommendation; reviewers should treat that as intentional, based on the workstation failure against `CUDA 13.x`.
 
 ## Not In Scope
 
-- Full redesign of the ProRes pipeline beyond shared helpers and preview reliability improvements
-- GPU validation on a machine with working CUDA drivers
-- Remote-safe file upload semantics
+- Full redesign of the ProRes pipeline beyond preview reliability and optional delivery MP4 support
+- Remote-safe upload semantics
+- Final cleanup of all overlapping GPU/NVENC capability checks into one shared capability-state module
 
 ## Follow-Up Recommendations
 
-- Run a GPU/NVENC validation pass on a machine with compatible NVIDIA drivers.
-- Consider additional documentation or release notes calling out the GUI workflow change.
+- Finish the remaining real-media GUI validation items in `TEST_TODO.md` on the downgraded workstation stack.
+- Complete the planned refactor to centralize full capability detection, not just runtime path discovery.
+- Consider release notes or migration notes calling out:
+  - the local-path GUI workflow
+  - the new portable CUDA auto-discovery behavior
+  - the Pascal recommendation to use `CUDA 12.9.x`
+  - the new target-resolution presets and fit-and-pad output behavior
 
 ## Reviewer Checklist
 
-- Confirm the local-path GUI model is acceptable for the upstream project direction.
-- Confirm the chunked standard assembly logic preserves expected output behavior.
-- Confirm the new quality presets and defaults are acceptable.
-- Confirm the README reflects the intended supported workflow.
-- Confirm whether `.gitignore` changes for `bin/` and `__pycache__/` should be included in the upstream PR.
+- Confirm the local-path GUI workflow is the intended product direction.
+- Confirm the chunked standard assembly path preserves expected output behavior.
+- Confirm the quality preset defaults are acceptable.
+- Confirm the runtime discovery behavior under `bin/CUDA/` is acceptable.
+- Confirm the `BEATSYNC_CUDA_DIR` override is acceptable.
+- Confirm the Pascal-oriented CUDA 12 recommendation is acceptable.
+- Confirm the README and `TEST_TODO.md` reflect the current state of the branch.
 
 ## Optional PR Metadata
 
 ### Screenshots / Video
 
-- Add updated UI screenshots showing the local path inputs and quality selector.
+- Add an updated startup screenshot from the GPU workstation.
+- Add one successful NVENC export log after the CUDA 12 re-test.
 
 ### Linked Issues
 
-- Add issue references here if the upstream repo tracks this problem.
+- Add issue references here if the upstream repo tracks this work.

@@ -300,7 +300,7 @@ INFO_AUDIO_FILE = (
 )
 LABEL_VIDEO_FOLDER = "Video Folder Path"
 INFO_VIDEO_FOLDER = (
-    "Absolute or relative local folder path containing MP4/MKV clips, or use Browse"
+    "Absolute or relative local folder path containing MP4/MKV clips; subfolders are scanned recursively, or use Browse"
 )
 LABEL_GENERATION_MODE = "Generation Mode"
 INFO_GENERATION_MODE = "Choose how beats are detected and selected"
@@ -315,6 +315,10 @@ INFO_PLAYBACK_SPEED = "Slow-motion / Normal / Fast-forward"
 LABEL_TIMING_OFFSET = "Timing Offset (seconds)"
 INFO_TIMING_OFFSET = (
     "Fine-tune sync: negative=earlier, positive=later (applied to video playback)"
+)
+LABEL_CUSTOM_RESOLUTION = "Custom Resolution"
+INFO_CUSTOM_RESOLUTION = (
+    "Leave at default to match the first source clip, or pick a common 16:9, 21:9, or 9:16 target. BeatSync preserves aspect ratio and pads to fit."
 )
 LABEL_CUSTOM_FPS = "Custom FPS (Frame Rate)"
 INFO_CUSTOM_FPS = "Leave empty for auto-detect, or enter a value such as 24 / 30 / 60"

@@ -1,3 +1,5 @@
 /bin/
 __pycache__/
 .vscode/
+/temp/
+/output/

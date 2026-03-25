@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
+import asyncio
+import asyncio.proactor_events
 import base64
 import datetime
 import multiprocessing
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from urllib.parse import unquote, urlparse
@@ -24,43 +27,29 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PORTABLE_CUDA_DIR = os.path.join(SCRIPT_DIR, "bin", "CUDA", "v13.0")
-PORTABLE_CUDA_BIN = os.path.join(PORTABLE_CUDA_DIR, "bin", "x64")
-PORTABLE_CUDA_LIB = os.path.join(PORTABLE_CUDA_DIR, "lib", "x64")
+from runtime_env import configure_portable_runtime
 
-if os.path.exists(PORTABLE_CUDA_DIR):
-    USING_PORTABLE_CUDA = True
-    os.environ["CUDA_PATH"] = PORTABLE_CUDA_DIR
-    os.environ["CUDA_HOME"] = PORTABLE_CUDA_DIR
-    os.environ["CUDA_ROOT"] = PORTABLE_CUDA_DIR
-    if PORTABLE_CUDA_BIN not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = PORTABLE_CUDA_BIN + os.pathsep + os.environ.get("PATH", "")
-    if os.path.exists(PORTABLE_CUDA_LIB) and PORTABLE_CUDA_LIB not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = PORTABLE_CUDA_LIB + os.pathsep + os.environ.get("PATH", "")
-    if "LD_LIBRARY_PATH" in os.environ:
-        os.environ["LD_LIBRARY_PATH"] = PORTABLE_CUDA_LIB + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
-    else:
-        os.environ["LD_LIBRARY_PATH"] = PORTABLE_CUDA_LIB
+RUNTIME = configure_portable_runtime(SCRIPT_DIR)
+PORTABLE_CUDA_DIR = RUNTIME.portable_cuda_dir
+USING_PORTABLE_CUDA = RUNTIME.using_portable_cuda
+PORTABLE_PYTHON_DIR = RUNTIME.portable_python_dir
+PORTABLE_PYTHON_EXE = RUNTIME.portable_python_exe
+USING_PORTABLE_PYTHON = RUNTIME.using_portable_python
+
+if USING_PORTABLE_CUDA and PORTABLE_CUDA_DIR:
     print(f"Using Portable CUDA: {PORTABLE_CUDA_DIR}")
 else:
-    USING_PORTABLE_CUDA = False
-    print(f"Portable CUDA not found at: {PORTABLE_CUDA_DIR}")
+    print(f"Portable CUDA not found under: {os.path.join(SCRIPT_DIR, 'bin', 'CUDA')}")
     print("   Will try to use system CUDA if available")
+if RUNTIME.cuda_notice:
+    print(f"   Note: {RUNTIME.cuda_notice}")
 
-PORTABLE_PYTHON_DIR = os.path.join(SCRIPT_DIR, "bin", "python-3.13.9-embed-amd64")
-PORTABLE_PYTHON_EXE = os.path.join(PORTABLE_PYTHON_DIR, "python.exe")
-
-if os.path.exists(PORTABLE_PYTHON_EXE):
-    USING_PORTABLE_PYTHON = True
-    if PORTABLE_PYTHON_DIR not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = PORTABLE_PYTHON_DIR + os.pathsep + os.environ.get("PATH", "")
-    os.environ["PYTHONHOME"] = PORTABLE_PYTHON_DIR
+if USING_PORTABLE_PYTHON and PORTABLE_PYTHON_EXE:
     print(f"Using Portable Python: {PORTABLE_PYTHON_EXE}")
 else:
-    USING_PORTABLE_PYTHON = False
     print("Portable Python not found, using system Python")
 
-from ffmpeg_processing import DEFAULT_STANDARD_QUALITY, FFMPEG_FOUND, FFMPEG_PATH, check_nvenc_support, create_lossless_delivery_mp4, get_video_fps, normalize_quality_profile
+from ffmpeg_processing import DEFAULT_STANDARD_QUALITY, FFMPEG_FOUND, FFMPEG_PATH, check_nvenc_support, create_lossless_delivery_mp4, get_video_fps, get_video_resolution, is_browser_playable_video, normalize_quality_profile
 from video_processor import CPU_COUNT, MAX_THREADS, PARALLEL_WORKERS, create_music_video, estimate_threads_per_job, get_local_temp_dir, get_video_files
 from manual_mode import analyze_beats_manual, process_manual_intensity
 from smart_mode import analyze_beats_smart, get_gpu_info, get_preset_info, is_gpu_available, select_beats_smart, set_gpu_mode
@@ -72,6 +61,20 @@ CPU_ONLY_MODE = not GPU_RUNTIME_AVAILABLE
 NVENC_AVAILABLE = GPU_RUNTIME_AVAILABLE and check_nvenc_support()
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+DEFAULT_GUI_PORT = 7860
+RESOLUTION_PRESET_CHOICES = [
+    ("Default (match first source video)", "default"),
+    ("16:9 | 1280x720 (HD)", "1280x720"),
+    ("16:9 | 1920x1080 (Full HD)", "1920x1080"),
+    ("16:9 | 2560x1440 (QHD)", "2560x1440"),
+    ("16:9 | 3840x2160 (4K UHD)", "3840x2160"),
+    ("21:9 | 2560x1080 (UltraWide HD)", "2560x1080"),
+    ("21:9 | 3440x1440 (UltraWide QHD)", "3440x1440"),
+    ("21:9 | 3840x1600 (UltraWide 1600p)", "3840x1600"),
+    ("9:16 | 720x1280 (Vertical HD)", "720x1280"),
+    ("9:16 | 1080x1920 (Vertical Full HD)", "1080x1920"),
+    ("9:16 | 1440x2560 (Vertical QHD)", "1440x2560"),
+]
 
 if hasattr(gr, "set_static_paths"):
     gr.set_static_paths(paths=[OUTPUT_DIR])
@@ -81,8 +84,8 @@ print(
         CPU_COUNT,
         estimate_threads_per_job(PARALLEL_WORKERS),
         PARALLEL_WORKERS,
-        f"Portable ({PORTABLE_PYTHON_EXE})" if USING_PORTABLE_PYTHON else f"System ({sys.executable})",
-        "Portable (bin/CUDA/v13.0)" if USING_PORTABLE_CUDA else "System (or not available)",
+        RUNTIME.python_runtime_label if USING_PORTABLE_PYTHON else f"System ({sys.executable})",
+        RUNTIME.cuda_runtime_label,
         librosa.__version__,
         "Portable (bin/ffmpeg/ffmpeg.exe)" if FFMPEG_FOUND else "System FFmpeg (portable not found)",
         GPU_RUNTIME_AVAILABLE,
@@ -92,12 +95,61 @@ print(
 )
 print(f"   Temp Directory: {get_local_temp_dir()}")
 print(f"   Output Directory: {OUTPUT_DIR}")
+
+
+def find_available_local_port(
+    preferred_port: int,
+    host: str = "127.0.0.1",
+    fallback_count: int = 20,
+) -> int:
+    """Return the first available localhost port starting at preferred_port."""
+    last_error = None
+    for port in range(preferred_port, preferred_port + max(1, fallback_count) + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((host, port))
+                return port
+            except OSError as exc:
+                last_error = exc
+
+    raise OSError(
+        f"Could not find an available localhost port in range {preferred_port}-{preferred_port + max(1, fallback_count)}"
+    ) from last_error
+
+
+def resolve_gui_port() -> int:
+    """Resolve the Gradio port, honoring GRADIO_SERVER_PORT when valid."""
+    raw_port = os.environ.get("GRADIO_SERVER_PORT", "").strip()
+    if raw_port:
+        try:
+            preferred_port = int(raw_port)
+        except ValueError:
+            print(f"Warning: Invalid GRADIO_SERVER_PORT={raw_port!r}; falling back to {DEFAULT_GUI_PORT}")
+            preferred_port = DEFAULT_GUI_PORT
+    else:
+        preferred_port = DEFAULT_GUI_PORT
+
+    return find_available_local_port(preferred_port=preferred_port)
 print(f"{CONSOLE_SEPARATOR}\n")
 
 StatusResult: TypeAlias = Tuple[str, str, Dict]
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac"}
 STANDARD_QUALITY_LABELS = [("Fast", "fast"), ("Balanced", "balanced"), ("High", "high")]
 POWERSHELL_EXECUTABLE = shutil.which("powershell.exe") or shutil.which("powershell") or "powershell"
+
+
+def parse_resolution_choice(resolution_choice: str | None) -> tuple[int, int] | None:
+    normalized = (resolution_choice or "default").strip().lower()
+    if not normalized or normalized == "default":
+        return None
+
+    width_str, height_str = normalized.split("x", 1)
+    width = int(width_str)
+    height = int(height_str)
+    if width <= 0 or height <= 0:
+        raise ValueError("Custom resolution must use positive width and height values.")
+    return width, height
 
 
 def normalize_local_path(path_value: str) -> str | None:
@@ -260,7 +312,11 @@ def resolve_inputs(audio_path: str, video_folder: str, session_state: dict) -> t
     return resolved_audio, resolved_video_paths, session_state
 
 
-def create_prores_preview(output_path: str, preview_path: str) -> str:
+def create_browser_preview(output_path: str, preview_path: str) -> str:
+    if is_browser_playable_video(output_path):
+        print("   Output is already browser-playable; no preview conversion needed.")
+        return output_path
+
     attempts: List[tuple[str, List[str]]] = []
     preferred_hwaccel = ["-hwaccel", "cuda"] if not CPU_ONLY_MODE else ["-hwaccel", "auto"]
     cpu_fallback_hwaccels = [preferred_hwaccel]
@@ -340,11 +396,50 @@ def create_prores_preview(output_path: str, preview_path: str) -> str:
         error_line = stderr_tail[-1] if stderr_tail else "unknown FFmpeg error"
         print(f"   Preview creation with {encoder_name} failed: {error_line}")
 
-    print("   Preview generation failed. Returning the ProRes file path instead.")
+    print("   Preview generation failed. Returning the original output path instead.")
     return output_path
 
 
-def process_video(audio_path: str, video_folder: str, generation_mode: str, cut_intensity: float, smart_preset: str, output_filename: str, direction: str, playback_speed_str: str, timing_offset: float, parallel_workers: int, processing_mode: str, standard_quality: str, create_prores_delivery_mp4: bool, custom_fps: float, session_state: dict) -> StatusResult:
+def configure_asyncio_exception_filter() -> None:
+    """Ignore benign Windows socket reset noise from closed browser transports."""
+    if os.name == "nt":
+        transport_type = getattr(asyncio.proactor_events, "_ProactorBasePipeTransport", None)
+        original_method = getattr(transport_type, "_call_connection_lost", None)
+
+        if transport_type and original_method and not getattr(original_method, "_beatsync_wrapped", False):
+            def wrapped_call_connection_lost(self, exc):
+                try:
+                    return original_method(self, exc)
+                except ConnectionResetError as reset_exc:
+                    if getattr(reset_exc, "winerror", None) == 10054:
+                        return None
+                    raise
+
+            wrapped_call_connection_lost._beatsync_wrapped = True
+            transport_type._call_connection_lost = wrapped_call_connection_lost
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    def exception_handler(active_loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        exc = context.get("exception")
+        message = str(context.get("message", ""))
+        if (
+            isinstance(exc, ConnectionResetError)
+            and getattr(exc, "winerror", None) == 10054
+            and "_ProactorBasePipeTransport._call_connection_lost" in message
+        ):
+            return
+
+        active_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(exception_handler)
+
+
+def process_video(audio_path: str, video_folder: str, generation_mode: str, cut_intensity: float, smart_preset: str, output_filename: str, direction: str, playback_speed_str: str, timing_offset: float, parallel_workers: int, processing_mode: str, standard_quality: str, create_prores_delivery_mp4: bool, custom_resolution: str, custom_fps: float, session_state: dict) -> StatusResult:
     try:
         session_state = session_state or {}
         resolved_audio_path, resolved_video_paths, session_state = resolve_inputs(
@@ -382,6 +477,13 @@ def process_video(audio_path: str, video_folder: str, generation_mode: str, cut_
         cuda_str = "Portable" if USING_PORTABLE_CUDA else "System/None"
 
         output_fps = custom_fps if custom_fps is not None and custom_fps > 0 else get_video_fps(resolved_video_paths[0])
+        selected_target_size = parse_resolution_choice(custom_resolution)
+        resolved_target_size = selected_target_size or get_video_resolution(resolved_video_paths[0])
+        resolution_info = (
+            f"{resolved_target_size[0]}x{resolved_target_size[1]} (custom)"
+            if selected_target_size is not None
+            else f"{resolved_target_size[0]}x{resolved_target_size[1]} (auto-detected)"
+        )
 
         name, _ = os.path.splitext(output_filename or "music_video.mp4")
         safe_name = os.path.basename(name) or "music_video"
@@ -429,11 +531,13 @@ def process_video(audio_path: str, video_folder: str, generation_mode: str, cut_
             use_gpu=use_gpu,
             gpu_encoder=gpu_encoder,
             fps=output_fps,
+            target_size=resolved_target_size,
             quality=quality,
             mode_name=generation_mode,
         )
 
         preview_path = output_path
+        preview_filename = None
         delivery_mp4_filename = None
         delivery_mp4_error = None
         preview_source_path = output_path
@@ -454,10 +558,15 @@ def process_video(audio_path: str, video_folder: str, generation_mode: str, cut_
                     delivery_mp4_error = str(exc)
                     print(f"   Delivery MP4 creation failed: {delivery_mp4_error}")
 
-            print("Generating H.264 preview for ProRes file...")
+            print("Generating browser-friendly preview for ProRes output...")
             preview_filename = f"{safe_name}_{timestamp}_preview.mp4"
             preview_path = os.path.join(OUTPUT_DIR, preview_filename)
-            preview_path = create_prores_preview(preview_source_path, preview_path)
+            preview_path = create_browser_preview(preview_source_path, preview_path)
+        elif not is_browser_playable_video(output_path):
+            print("Generating browser-friendly preview for non-playable output...")
+            preview_filename = f"{safe_name}_{timestamp}_preview.mp4"
+            preview_path = os.path.join(OUTPUT_DIR, preview_filename)
+            preview_path = create_browser_preview(output_path, preview_path)
 
         gpu_info = f"GPU: {get_gpu_info()}" if use_gpu else "CPU"
         fps_info = f"{output_fps:.2f} FPS (custom)" if custom_fps else f"{output_fps:.2f} FPS (auto-detected)"
@@ -556,6 +665,9 @@ def process_video(audio_path: str, video_folder: str, generation_mode: str, cut_
             status_msg += f"\nDelivery MP4: {delivery_mp4_filename}"
         elif is_prores and create_prores_delivery_mp4 and delivery_mp4_error:
             status_msg += f"\nDelivery MP4: Failed ({delivery_mp4_error})"
+        if preview_filename and os.path.normcase(preview_path) != os.path.normcase(output_path):
+            status_msg += f"\nBrowser Preview: {preview_filename}"
+        status_msg += f"\nTarget Resolution: {resolution_info}"
 
         return preview_path, status_msg, session_state
     except Exception as e:
@@ -594,7 +706,7 @@ def create_ui() -> gr.Blocks:
         else "⚠️  System Python"
     )
     cuda_status = (
-        "✅ Portable (bin/CUDA/v13.0)"
+        f"✅ {RUNTIME.cuda_runtime_label}"
         if USING_PORTABLE_CUDA
         else "⚠️  System CUDA (or not available)"
     )
@@ -673,6 +785,12 @@ def create_ui() -> gr.Blocks:
                     direction = gr.Radio(choices=["forward", "backward", "random"], value="forward", label=LABEL_DIRECTION, info=INFO_DIRECTION)
                     playback_speed = gr.Radio(choices=["Normal Speed", "Half Speed", "Double Speed"], value="Normal Speed", label=LABEL_PLAYBACK_SPEED, info=INFO_PLAYBACK_SPEED)
                     timing_offset = gr.Slider(minimum=-0.5, maximum=0.5, value=0.0, step=0.01, label=LABEL_TIMING_OFFSET, info=INFO_TIMING_OFFSET)
+                    custom_resolution = gr.Dropdown(
+                        choices=RESOLUTION_PRESET_CHOICES,
+                        value="default",
+                        label=LABEL_CUSTOM_RESOLUTION,
+                        info=INFO_CUSTOM_RESOLUTION,
+                    )
                     custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
 
                 with gr.Group():
@@ -784,6 +902,7 @@ def create_ui() -> gr.Blocks:
                 processing_mode,
                 standard_quality,
                 prores_delivery_mp4,
+                custom_resolution,
                 custom_fps,
                 session_state,
             ],
@@ -799,16 +918,21 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
 
+    configure_asyncio_exception_filter()
     cleanup_on_startup()
+    launch_port = resolve_gui_port()
     print("Starting Gradio interface...")
-    print("   URL: http://127.0.0.1:7860")
+    if launch_port != DEFAULT_GUI_PORT:
+        print(f"   Preferred port {DEFAULT_GUI_PORT} is busy; using http://127.0.0.1:{launch_port}")
+    else:
+        print(f"   URL: http://127.0.0.1:{launch_port}")
     print("   Local path workflow: ENABLED")
     print(f"\n{CONSOLE_SEPARATOR}\n")
 
     app = create_ui()
     app.launch(
         server_name="127.0.0.1",
-        server_port=7860,
+        server_port=launch_port,
         share=False,
         inbrowser=True,
         show_error=True,

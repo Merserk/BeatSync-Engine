@@ -14,6 +14,12 @@ import warnings
 # Determine script directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+from runtime_env import configure_portable_runtime
+
+RUNTIME = configure_portable_runtime(SCRIPT_DIR)
+if RUNTIME.cuda_notice:
+    print(f"Portable CUDA note: {RUNTIME.cuda_notice}")
+
 # GPU Support (optional for faster processing)
 try:
     import cupy as cp
@@ -23,6 +29,22 @@ except ImportError:
     cp = None
 
 warnings.filterwarnings('ignore')
+
+
+def _clear_cupy_memory() -> None:
+    """Release cached CuPy allocations after an optional GPU attempt."""
+    if cp is None:
+        return
+    try:
+        cp.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+
+
+def _summarize_exception(exc: Exception) -> str:
+    """Keep optional GPU fallback errors to a single readable line."""
+    message = str(exc).strip()
+    return message.splitlines()[0] if message else exc.__class__.__name__
 
 
 def analyze_beats_auto(audio_file: str, start_time: float = 0.0, 
@@ -98,6 +120,7 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         'rhythm_data': rhythm_data,
         'rhythm_patterns': rhythm_patterns,
         'selection_info': selection_info,
+        'analysis_device': rhythm_data.get('analysis_device', 'gpu' if use_gpu and GPU_AVAILABLE else 'cpu'),
         'mode': 'auto'
     }
     
@@ -294,46 +317,52 @@ def analyze_multi_band_rhythm(y: np.ndarray, sr: int, beat_times: np.ndarray, us
     Analyze rhythm across multiple frequency bands.
     Kick (20-150 Hz), Clap/Snare (150-4000 Hz), Hi-hat (4000+ Hz), Bass (20-200 Hz)
     """
-    # Use GPU if available
-    xp = cp if (use_gpu and GPU_AVAILABLE) else np
-    
-    # Compute STFT
-    stft = librosa.stft(y, n_fft=2048, hop_length=512)
+    analysis_on_gpu = False
+
     if use_gpu and GPU_AVAILABLE:
-        stft = cp.asarray(stft)
-    
-    # Frequency bins
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
-    if use_gpu and GPU_AVAILABLE:
-        freqs = cp.asarray(freqs)
-    
-    # Define frequency bands
-    kick_band = (freqs >= 20) & (freqs <= 150)
-    clap_band = (freqs >= 150) & (freqs <= 4000)
-    hihat_band = freqs >= 4000
-    bass_band = (freqs >= 20) & (freqs <= 200)
-    
-    # Extract onset envelopes for each band
-    kick_onset = xp.sum(xp.abs(stft[kick_band, :]), axis=0)
-    clap_onset = xp.sum(xp.abs(stft[clap_band, :]), axis=0)
-    hihat_onset = xp.sum(xp.abs(stft[hihat_band, :]), axis=0)
-    bass_onset = xp.sum(xp.abs(stft[bass_band, :]), axis=0)
-    
-    # Normalize
-    kick_onset = kick_onset / (xp.max(kick_onset) + 1e-6)
-    clap_onset = clap_onset / (xp.max(clap_onset) + 1e-6)
-    hihat_onset = hihat_onset / (xp.max(hihat_onset) + 1e-6)
-    bass_onset = bass_onset / (xp.max(bass_onset) + 1e-6)
-    
-    # Convert back to CPU if using GPU
-    if use_gpu and GPU_AVAILABLE:
-        kick_onset = cp.asnumpy(kick_onset)
-        clap_onset = cp.asnumpy(clap_onset)
-        hihat_onset = cp.asnumpy(hihat_onset)
-        bass_onset = cp.asnumpy(bass_onset)
-        
-        # Clear GPU memory
-        cp.get_default_memory_pool().free_all_blocks()
+        try:
+            stft = cp.asarray(librosa.stft(y, n_fft=2048, hop_length=512))
+            freqs = cp.asarray(librosa.fft_frequencies(sr=sr, n_fft=2048))
+
+            kick_band = (freqs >= 20) & (freqs <= 150)
+            clap_band = (freqs >= 150) & (freqs <= 4000)
+            hihat_band = freqs >= 4000
+            bass_band = (freqs >= 20) & (freqs <= 200)
+
+            kick_onset = cp.sum(cp.abs(stft[kick_band, :]), axis=0)
+            clap_onset = cp.sum(cp.abs(stft[clap_band, :]), axis=0)
+            hihat_onset = cp.sum(cp.abs(stft[hihat_band, :]), axis=0)
+            bass_onset = cp.sum(cp.abs(stft[bass_band, :]), axis=0)
+
+            kick_onset = cp.asnumpy(kick_onset / (cp.max(kick_onset) + 1e-6))
+            clap_onset = cp.asnumpy(clap_onset / (cp.max(clap_onset) + 1e-6))
+            hihat_onset = cp.asnumpy(hihat_onset / (cp.max(hihat_onset) + 1e-6))
+            bass_onset = cp.asnumpy(bass_onset / (cp.max(bass_onset) + 1e-6))
+            analysis_on_gpu = True
+        except Exception as exc:
+            print(f"      GPU rhythm analysis failed: {_summarize_exception(exc)}")
+            print("      Falling back to CPU rhythm analysis")
+        finally:
+            _clear_cupy_memory()
+
+    if not analysis_on_gpu:
+        stft = librosa.stft(y, n_fft=2048, hop_length=512)
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+
+        kick_band = (freqs >= 20) & (freqs <= 150)
+        clap_band = (freqs >= 150) & (freqs <= 4000)
+        hihat_band = freqs >= 4000
+        bass_band = (freqs >= 20) & (freqs <= 200)
+
+        kick_onset = np.sum(np.abs(stft[kick_band, :]), axis=0)
+        clap_onset = np.sum(np.abs(stft[clap_band, :]), axis=0)
+        hihat_onset = np.sum(np.abs(stft[hihat_band, :]), axis=0)
+        bass_onset = np.sum(np.abs(stft[bass_band, :]), axis=0)
+
+        kick_onset = kick_onset / (np.max(kick_onset) + 1e-6)
+        clap_onset = clap_onset / (np.max(clap_onset) + 1e-6)
+        hihat_onset = hihat_onset / (np.max(hihat_onset) + 1e-6)
+        bass_onset = bass_onset / (np.max(bass_onset) + 1e-6)
     
     # Sample strength at each beat
     beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=512)
@@ -388,7 +417,8 @@ def analyze_multi_band_rhythm(y: np.ndarray, sr: int, beat_times: np.ndarray, us
         'is_strong_kick': is_strong_kick,
         'is_strong_clap': is_strong_clap,
         'is_strong_hihat': is_strong_hihat,
-        'is_strong_bass': is_strong_bass
+        'is_strong_bass': is_strong_bass,
+        'analysis_device': 'gpu' if analysis_on_gpu else 'cpu'
     }
 
 

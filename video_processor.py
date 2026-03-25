@@ -26,40 +26,26 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PORTABLE_CUDA_DIR = os.path.join(SCRIPT_DIR, "bin", "CUDA", "v13.0")
-PORTABLE_CUDA_BIN = os.path.join(PORTABLE_CUDA_DIR, "bin", "x64")
-PORTABLE_CUDA_LIB = os.path.join(PORTABLE_CUDA_DIR, "lib", "x64")
+from runtime_env import configure_portable_runtime
 
-if os.path.exists(PORTABLE_CUDA_DIR):
-    USING_PORTABLE_CUDA = True
-    os.environ["CUDA_PATH"] = PORTABLE_CUDA_DIR
-    os.environ["CUDA_HOME"] = PORTABLE_CUDA_DIR
-    os.environ["CUDA_ROOT"] = PORTABLE_CUDA_DIR
-    if PORTABLE_CUDA_BIN not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = PORTABLE_CUDA_BIN + os.pathsep + os.environ.get("PATH", "")
-    if os.path.exists(PORTABLE_CUDA_LIB) and PORTABLE_CUDA_LIB not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = PORTABLE_CUDA_LIB + os.pathsep + os.environ.get("PATH", "")
-    if "LD_LIBRARY_PATH" in os.environ:
-        os.environ["LD_LIBRARY_PATH"] = PORTABLE_CUDA_LIB + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
-    else:
-        os.environ["LD_LIBRARY_PATH"] = PORTABLE_CUDA_LIB
+RUNTIME = configure_portable_runtime(SCRIPT_DIR)
+PORTABLE_CUDA_DIR = RUNTIME.portable_cuda_dir
+USING_PORTABLE_CUDA = RUNTIME.using_portable_cuda
+PORTABLE_PYTHON_DIR = RUNTIME.portable_python_dir
+PORTABLE_PYTHON_EXE = RUNTIME.portable_python_exe
+USING_PORTABLE_PYTHON = RUNTIME.using_portable_python
+
+if USING_PORTABLE_CUDA and PORTABLE_CUDA_DIR:
     print(f"Using Portable CUDA: {PORTABLE_CUDA_DIR}")
 else:
-    USING_PORTABLE_CUDA = False
-    print(f"Portable CUDA not found at: {PORTABLE_CUDA_DIR}")
+    print(f"Portable CUDA not found under: {os.path.join(SCRIPT_DIR, 'bin', 'CUDA')}")
     print("   Will try to use system CUDA if available")
+if RUNTIME.cuda_notice:
+    print(f"   Note: {RUNTIME.cuda_notice}")
 
-PORTABLE_PYTHON_DIR = os.path.join(SCRIPT_DIR, "bin", "python-3.13.9-embed-amd64")
-PORTABLE_PYTHON_EXE = os.path.join(PORTABLE_PYTHON_DIR, "python.exe")
-
-if os.path.exists(PORTABLE_PYTHON_EXE):
-    USING_PORTABLE_PYTHON = True
-    if PORTABLE_PYTHON_DIR not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = PORTABLE_PYTHON_DIR + os.pathsep + os.environ.get("PATH", "")
-    os.environ["PYTHONHOME"] = PORTABLE_PYTHON_DIR
+if USING_PORTABLE_PYTHON and PORTABLE_PYTHON_EXE:
     print(f"Using Portable Python: {PORTABLE_PYTHON_EXE}")
 else:
-    USING_PORTABLE_PYTHON = False
     print("Portable Python not found, using system Python")
 
 from ffmpeg_processing import (
@@ -72,6 +58,8 @@ from ffmpeg_processing import (
     extract_prores_segment_ffmpeg,
     frame_count_to_seconds,
     get_quality_summary,
+    has_valid_video_stream,
+    split_valid_video_files,
     get_video_duration,
     get_video_fps,
     get_video_resolution,
@@ -113,7 +101,7 @@ print(f"CPU Optimization: Detected {CPU_COUNT} threads")
 print(f"Parallel Processing: {PARALLEL_WORKERS} workers for simultaneous clip processing")
 print(f"Local Temp Directory: {LOCAL_TEMP_DIR}")
 print("Python: Portable (bin/python-3.13.9-embed-amd64/)" if USING_PORTABLE_PYTHON else f"Python: System ({sys.executable})")
-print("CUDA: Portable (bin/CUDA/v13.0)" if USING_PORTABLE_CUDA else "CUDA: System (or not available)")
+print(f"CUDA: {RUNTIME.cuda_runtime_label}" if USING_PORTABLE_CUDA else "CUDA: System (or not available)")
 print(f"GPU Acceleration: AVAILABLE - {get_gpu_info()}" if GPU_AVAILABLE else f"GPU Acceleration: NOT AVAILABLE - {get_gpu_info()}")
 
 
@@ -171,11 +159,11 @@ def get_video_files(directory: str) -> VideoList:
     video_extensions = {".mp4", ".mkv"}
     video_files = sorted(
         str(path)
-        for path in Path(directory).iterdir()
+        for path in Path(directory).rglob("*")
         if path.is_file() and path.suffix.lower() in video_extensions
     )
     if not video_files:
-        raise ValueError(f"No MP4/MKV files found in {directory}")
+        raise ValueError(f"No MP4/MKV files found in {directory} or its subfolders")
     return video_files
 
 
@@ -269,9 +257,19 @@ def plan_segments(video_files: VideoList, beat_times: BeatTimes, fps: float, spe
     return planned_segments
 
 
-def render_standard_segment(job: SegmentJob, target_size: tuple[int, int], use_nvenc: bool, gpu_encoder: str, fps: float, quality: str, threads_per_job: int, temp_dir: str, temp_ext: str) -> tuple[int, str | None, str | None]:
+def render_standard_segment(
+    job: SegmentJob,
+    target_size: tuple[int, int],
+    use_nvenc: bool,
+    gpu_encoder: str,
+    fps: float,
+    quality: str,
+    threads_per_job: int,
+    temp_dir: str,
+    temp_ext: str,
+) -> tuple[int, str | None, str | None, str | None]:
     output_file = os.path.join(temp_dir, f"segment_{job.index:05d}{temp_ext}")
-    success = extract_clip_segment_ffmpeg(
+    success, recovery_label, failure_detail = extract_clip_segment_ffmpeg(
         video_file=job.video_file,
         start_time=job.start_time,
         duration=job.source_duration,
@@ -286,8 +284,8 @@ def render_standard_segment(job: SegmentJob, target_size: tuple[int, int], use_n
         threads_per_job=threads_per_job,
     )
     if not success:
-        return job.index, None, "FFmpeg extraction failed"
-    return job.index, output_file, None
+        return job.index, None, failure_detail or "FFmpeg extraction failed", None
+    return job.index, output_file, None, recovery_label
 
 
 def render_prores_segment(job: SegmentJob, target_size: tuple[int, int], fps: float, prores_map: Dict[str, str], segments_dir: str) -> str:
@@ -305,10 +303,13 @@ def render_prores_segment(job: SegmentJob, target_size: tuple[int, int], fps: fl
     )
 
 
-def render_standard_chunk(chunk_index: int, jobs: List[SegmentJob], target_size: tuple[int, int], use_nvenc: bool, gpu_encoder: str, fps: float, quality: str, threads_per_job: int, max_workers: int, session_temp_dir: str, chunk_output_dir: str, temp_ext: str) -> tuple[str, int]:
+def render_standard_chunk(chunk_index: int, jobs: List[SegmentJob], target_size: tuple[int, int], use_nvenc: bool, gpu_encoder: str, fps: float, quality: str, threads_per_job: int, max_workers: int, session_temp_dir: str, chunk_output_dir: str, temp_ext: str) -> tuple[str, int, int]:
     chunk_temp_dir = os.path.join(session_temp_dir, f"chunk_{chunk_index:04d}")
     os.makedirs(chunk_temp_dir, exist_ok=True)
     rendered_segments: Dict[int, str] = {}
+    failed_segments = 0
+    recovered_segments = 0
+    recovery_mode_counts: Dict[str, int] = {}
 
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -331,30 +332,72 @@ def render_standard_chunk(chunk_index: int, jobs: List[SegmentJob], target_size:
             for future in as_completed(future_to_job):
                 job = future_to_job[future]
                 try:
-                    index, clip_path, error = future.result()
+                    index, clip_path, error, recovery_label = future.result()
                 except Exception as exc:
                     print(f"Warning: Error processing clip {job.index + 1}: {exc}")
+                    failed_segments += 1
                     continue
 
                 if error:
                     print(f"Warning: Clip {job.index + 1} failed: {error}")
+                    failed_segments += 1
                     continue
 
                 if clip_path:
                     rendered_segments[index] = clip_path
+                if recovery_label:
+                    recovered_segments += 1
+                    recovery_mode_counts[recovery_label] = recovery_mode_counts.get(recovery_label, 0) + 1
 
         ordered_clips = [rendered_segments[job.index] for job in jobs if job.index in rendered_segments]
+        ordered_clips, invalid_rendered_clips = split_valid_video_files(ordered_clips)
+        if invalid_rendered_clips:
+            failed_segments += len(invalid_rendered_clips)
+            print(
+                f"   Warning: chunk {chunk_index} dropped {len(invalid_rendered_clips)} rendered clip(s) with no readable video stream before assembly."
+            )
         if not ordered_clips:
             raise ValueError(f"No valid clips were rendered for chunk {chunk_index}")
 
+        if recovered_segments:
+            recovery_summary = ", ".join(
+                f"{label}={count}" for label, count in sorted(recovery_mode_counts.items())
+            )
+            print(
+                f"   Note: chunk {chunk_index} recovered {recovered_segments} clip(s) after retry "
+                f"({recovery_summary})."
+            )
+
+        if failed_segments:
+            print(
+                f"   Warning: chunk {chunk_index} skipped {failed_segments} clip(s) after retries; output will still be assembled from the successful segments."
+            )
+
         chunk_output = os.path.join(chunk_output_dir, f"chunk_{chunk_index:04d}{temp_ext}")
-        concatenate_videos_ffmpeg(
-            video_files=ordered_clips,
-            output_file=chunk_output,
-            temp_dir=chunk_temp_dir,
-            stream_copy=True,
-        )
-        return chunk_output, len(ordered_clips)
+        try:
+            concatenate_videos_ffmpeg(
+                video_files=ordered_clips,
+                output_file=chunk_output,
+                temp_dir=chunk_temp_dir,
+                stream_copy=True,
+            )
+        except Exception as exc:
+            print(f"   Warning: stream-copy chunk assembly failed ({exc}). Retrying chunk {chunk_index} with re-encode...")
+            concatenate_videos_ffmpeg(
+                video_files=ordered_clips,
+                output_file=chunk_output,
+                use_nvenc=use_nvenc,
+                gpu_encoder=gpu_encoder,
+                fps=fps,
+                temp_dir=chunk_temp_dir,
+                stream_copy=False,
+                quality=quality,
+                threads_per_job=threads_per_job,
+            )
+
+        if not has_valid_video_stream(chunk_output):
+            raise ValueError(f"Chunk {chunk_index} output is missing a readable video stream")
+        return chunk_output, len(ordered_clips), failed_segments
     finally:
         for file_name in os.listdir(chunk_temp_dir):
             file_path = os.path.join(chunk_temp_dir, file_name)
@@ -392,11 +435,12 @@ def render_and_assemble_standard(audio_file: str, segment_plan: List[SegmentJob]
 
     chunk_outputs: List[str] = []
     total_rendered = 0
+    total_failed = 0
 
     for chunk_index, start_index in enumerate(range(0, len(segment_plan), chunk_size), start=1):
         chunk_jobs = segment_plan[start_index : start_index + chunk_size]
         print(f"Rendering chunk {chunk_index} with {len(chunk_jobs)} clips...")
-        chunk_output, rendered_count = render_standard_chunk(
+        chunk_output, rendered_count, failed_count = render_standard_chunk(
             chunk_index=chunk_index,
             jobs=chunk_jobs,
             target_size=target_size,
@@ -412,11 +456,20 @@ def render_and_assemble_standard(audio_file: str, segment_plan: List[SegmentJob]
         )
         chunk_outputs.append(chunk_output)
         total_rendered += rendered_count
+        total_failed += failed_count
         progress = (min(start_index + len(chunk_jobs), len(segment_plan)) / len(segment_plan)) * 100
         print(f"   Progress: {total_rendered} rendered clips, {progress:.1f}% of plan processed")
 
     if not chunk_outputs:
         raise ValueError("No valid chunk outputs were created.")
+
+    chunk_outputs, invalid_chunk_outputs = split_valid_video_files(chunk_outputs)
+    if invalid_chunk_outputs:
+        print(
+            f"Warning: Dropping {len(invalid_chunk_outputs)} invalid chunk output(s) before final assembly."
+        )
+    if not chunk_outputs:
+        raise ValueError("No valid chunk outputs remained for final assembly.")
 
     print("\n" + "=" * 60)
     print(f"FINAL ASSEMBLY: Concatenating {len(chunk_outputs)} chunk(s)")
@@ -439,6 +492,17 @@ def render_and_assemble_standard(audio_file: str, segment_plan: List[SegmentJob]
                 os.remove(chunk_output)
         except OSError:
             pass
+
+    if total_failed:
+        print("\n" + "!" * 60)
+        print(
+            f"WARNING: {total_failed} clip(s) were skipped during standard rendering after retries."
+        )
+        print(
+            "   The output file was still created, but timing or visual coverage may differ slightly from the original plan."
+        )
+        print("   Check the earlier FFmpeg warnings and consider rerunning if exact coverage matters.")
+        print("!" * 60 + "\n")
 
     return output_file
 
@@ -519,7 +583,7 @@ def cleanup_session_temp_dir(session_temp_dir: str) -> None:
         print(f"Warning: Could not delete session temp directory: {exc}")
 
 
-def create_music_video(audio_file: str, video_files: VideoList, beat_times: BeatTimes, cut_intensity, default_duration: float = 2.0, output_file: str = "output_music_video.mkv", start_time: float = 0.0, end_time: float | None = None, direction: str = "random", speed_factor: float = 1.0, timing_offset: float = 0.0, max_workers: int | None = None, smart_mode: bool = False, beat_info: dict | None = None, lossless_mode: bool = False, use_gpu: bool = False, gpu_encoder: str = "h264_nvenc", fps: float | None = None, quality: str = DEFAULT_STANDARD_QUALITY, mode_name: str | None = None) -> str:
+def create_music_video(audio_file: str, video_files: VideoList, beat_times: BeatTimes, cut_intensity, default_duration: float = 2.0, output_file: str = "output_music_video.mkv", start_time: float = 0.0, end_time: float | None = None, direction: str = "random", speed_factor: float = 1.0, timing_offset: float = 0.0, max_workers: int | None = None, smart_mode: bool = False, beat_info: dict | None = None, lossless_mode: bool = False, use_gpu: bool = False, gpu_encoder: str = "h264_nvenc", fps: float | None = None, target_size: tuple[int, int] | None = None, quality: str = DEFAULT_STANDARD_QUALITY, mode_name: str | None = None) -> str:
     if len(beat_times) == 0:
         raise ValueError("No beats were detected. Cannot create video.")
 
@@ -543,7 +607,8 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
 
     use_nvenc = use_gpu and NVENC_AVAILABLE and not lossless_mode and gpu_encoder != "none"
     threads_per_job = estimate_threads_per_job(max_workers)
-    gpu_status = "GPU" if use_gpu and GPU_AVAILABLE else "CPU"
+    analysis_device = (beat_info or {}).get("analysis_device")
+    gpu_status = "GPU" if analysis_device == "gpu" else "CPU" if analysis_device == "cpu" else ("GPU" if use_gpu and GPU_AVAILABLE else "CPU")
     encoder_status = gpu_encoder.upper() if use_nvenc else ("ProRes 422 Proxy" if lossless_mode else "libx264")
     python_status = "Portable" if USING_PORTABLE_PYTHON else "System"
     cuda_status = "Portable" if USING_PORTABLE_CUDA else "System/None"
@@ -580,8 +645,11 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     if selected_beats[-1] < audio_duration:
         selected_beats = np.append(selected_beats, audio_duration)
 
-    target_size = get_video_resolution(video_files[0])
-    print(f"Target resolution: {target_size[0]}x{target_size[1]}")
+    if target_size is None:
+        target_size = get_video_resolution(video_files[0])
+        print(f"Target resolution: {target_size[0]}x{target_size[1]} (auto-detected)")
+    else:
+        print(f"Target resolution: {target_size[0]}x{target_size[1]} (custom)")
     print(f"Creating video with {len(selected_beats) - 1} cuts")
     if timing_offset != 0.0:
         print(f"Timing offset: {timing_offset:.3f}s (applied to video playback, not beats)")
@@ -625,7 +693,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             )
 
         print("\n" + "=" * 60)
-        print("VIDEO CREATION COMPLETE")
+        print("VIDEO RENDER COMPLETE")
         print(f"   Output: {output_file}")
         print(f"   FPS: {fps} (frame-accurate)")
         print(f"   Total Cuts: {len(segment_plan)}")
@@ -658,7 +726,7 @@ def main() -> None:
     threads_per_job = estimate_threads_per_job(PARALLEL_WORKERS)
 
     python_str = "Portable (bin/python-3.13.9-embed-amd64/)" if USING_PORTABLE_PYTHON else f"System ({sys.executable})"
-    cuda_str = "Portable (bin/CUDA/v13.0)" if USING_PORTABLE_CUDA else "System/None"
+    cuda_str = RUNTIME.cuda_runtime_label if USING_PORTABLE_CUDA else "System/None"
 
     print("\n" + "=" * 60)
     print("MUSIC VIDEO CUTTER - FRAME-ACCURATE")

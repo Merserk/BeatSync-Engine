@@ -22,9 +22,28 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Set up portable FFmpeg path
 FFMPEG_PATH = os.path.join(SCRIPT_DIR, "bin", "ffmpeg", "ffmpeg.exe")
 FFPROBE_PATH = os.path.join(SCRIPT_DIR, "bin", "ffmpeg", "ffprobe.exe")
+FFMPEG_DIR = os.path.dirname(FFMPEG_PATH)
+
+
+def prepend_path_once(entry: str) -> None:
+    """Prepend a directory to PATH once, preserving existing entries."""
+    if not entry:
+        return
+
+    current = os.environ.get("PATH", "")
+    path_entries = [item for item in current.split(os.pathsep) if item]
+    normalized_entry = os.path.normcase(os.path.normpath(entry))
+    normalized_entries = {
+        os.path.normcase(os.path.normpath(item))
+        for item in path_entries
+    }
+
+    if normalized_entry not in normalized_entries:
+        os.environ["PATH"] = entry + os.pathsep + current if current else entry
 
 # Check if portable FFmpeg exists
 if os.path.exists(FFMPEG_PATH):
+    prepend_path_once(FFMPEG_DIR)
     os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_PATH
     os.environ["FFMPEG_BINARY"] = FFMPEG_PATH
     if os.path.exists(FFPROBE_PATH):
@@ -201,6 +220,70 @@ def get_video_resolution(video_file: str) -> Tuple[int, int]:
         return (1920, 1080)
 
 
+def get_video_codec(video_file: str) -> str | None:
+    """Get the primary video codec name using ffprobe."""
+    try:
+        probe_cmd = [
+            FFPROBE_PATH,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            video_file,
+        ]
+
+        result = subprocess.run(
+            probe_cmd, capture_output=True, text=True, timeout=10
+        )
+        codec = result.stdout.strip().splitlines()
+        return codec[0].strip().lower() if codec else None
+    except Exception as e:
+        print(f"   Could not get video codec with ffprobe: {e}")
+        return None
+
+
+def is_browser_playable_video(video_file: str) -> bool:
+    """Return True when the container/codec pair is browser-friendly for Gradio playback."""
+    container = os.path.splitext(video_file)[1].lower()
+    video_codec = get_video_codec(video_file)
+    return (container, video_codec) in {
+        (".mp4", "h264"),
+        (".mp4", "av1"),
+        (".ogg", "theora"),
+        (".webm", "vp9"),
+        (".webm", "vp8"),
+        (".webm", "av1"),
+    }
+
+
+def has_valid_video_stream(video_file: str) -> bool:
+    """Return True when the file exists, is non-empty, and ffprobe sees a video stream."""
+    if not os.path.exists(video_file):
+        return False
+    try:
+        if os.path.getsize(video_file) <= 0:
+            return False
+    except OSError:
+        return False
+    return get_video_codec(video_file) is not None
+
+
+def split_valid_video_files(video_files: List[str]) -> Tuple[List[str], List[str]]:
+    """Split paths into valid and invalid video files using ffprobe stream validation."""
+    valid_files: List[str] = []
+    invalid_files: List[str] = []
+    for video_file in video_files:
+        if has_valid_video_stream(video_file):
+            valid_files.append(video_file)
+        else:
+            invalid_files.append(video_file)
+    return valid_files, invalid_files
+
+
 def seconds_to_frame_count(seconds: float, fps: float) -> int:
     """Convert seconds to exact frame count."""
     return int(round(seconds * fps))
@@ -332,6 +415,7 @@ def build_standard_video_encode_args(
     gpu_encoder: str,
     quality: str,
     threads_per_job: int,
+    cpu_encoder: str = "libx264",
 ) -> List[str]:
     """Build codec arguments for standard exports."""
     quality = normalize_quality_profile(quality)
@@ -354,9 +438,9 @@ def build_standard_video_encode_args(
         ]
 
     settings = CPU_QUALITY_SETTINGS[quality]
-    return [
+    args = [
         "-c:v",
-        "libx264",
+        cpu_encoder,
         "-preset",
         str(settings["preset"]),
         "-crf",
@@ -366,6 +450,9 @@ def build_standard_video_encode_args(
         "-threads",
         str(max(1, int(threads_per_job))),
     ]
+    if cpu_encoder == "libx265":
+        args.extend(["-tag:v", "hvc1"])
+    return args
 
 
 def build_audio_input_args(audio_file: str, start_time: float, end_time: float | None) -> List[str]:
@@ -388,6 +475,55 @@ def write_concat_file(video_files: List[str], concat_file: str) -> None:
             handle.write(f"file '{escaped_path}'\n")
 
 
+def get_target_size_filters(target_size: Tuple[int, int]) -> List[str]:
+    """Build aspect-ratio-safe fit-and-pad filters for a target frame size."""
+    width, height = target_size
+    return [
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
+        "setsar=1",
+    ]
+
+
+def get_segment_timeout_seconds(
+    duration: float,
+    reverse: bool = False,
+    prores: bool = False,
+) -> int:
+    """Return a conservative timeout for per-segment extraction jobs."""
+    safe_duration = max(0.1, float(duration))
+    if prores:
+        base_timeout = 240
+        timeout = base_timeout + int(safe_duration * 45)
+        if reverse:
+            timeout += 120
+        return min(900, max(240, timeout))
+
+    base_timeout = 180
+    timeout = base_timeout + int(safe_duration * 30)
+    if reverse:
+        timeout += 90
+    return min(360, max(180, timeout))
+
+
+def summarize_ffmpeg_error(stderr: str | None, fallback: str) -> str:
+    """Return the most useful FFmpeg error summary available."""
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return fallback
+
+    generic_lines = {
+        "Conversion failed!",
+        "Error while processing the decoded data for stream #0:0",
+    }
+    informative_lines = [line for line in lines if line not in generic_lines]
+    if not informative_lines:
+        return lines[-1]
+
+    tail = informative_lines[-3:]
+    return " | ".join(tail)
+
+
 def extract_clip_segment_ffmpeg(
     video_file: str,
     start_time: float,
@@ -401,10 +537,13 @@ def extract_clip_segment_ffmpeg(
     gpu_encoder: str = "h264_nvenc",
     quality: str = DEFAULT_STANDARD_QUALITY,
     threads_per_job: int = 1,
-) -> bool:
+) -> Tuple[bool, str | None, str | None]:
     """Extract and encode a frame-accurate standard segment."""
     try:
         frame_count = seconds_to_frame_count(duration, fps)
+        timeout_seconds = get_segment_timeout_seconds(duration, reverse=reverse, prores=False)
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        cpu_fallback_encoder = "libx265" if gpu_encoder == "hevc_nvenc" else "libx264"
 
         filters = []
 
@@ -415,62 +554,93 @@ def extract_clip_segment_ffmpeg(
             filters.append("reverse")
 
         if target_size:
-            width, height = target_size
-            filters.append(f"scale={width}:{height}")
+            filters.extend(get_target_size_filters(target_size))
 
         filters.append(f"fps={fps}")
         filter_complex = ",".join(filters)
-
-        cmd = [FFMPEG_PATH]
+        decode_attempts: List[Tuple[str, List[str], bool, bool, str]] = [("software decode", [], False, use_nvenc, cpu_fallback_encoder)]
         if use_nvenc:
-            cmd.extend(["-hwaccel", "cuda"])
+            decode_attempts.insert(0, ("CUDA decode", ["-hwaccel", "cuda"], False, True, cpu_fallback_encoder))
+            decode_attempts.append(("software decode with accurate seek", [], True, True, cpu_fallback_encoder))
+            decode_attempts.append((f"CPU encode fallback ({cpu_fallback_encoder})", [], True, False, cpu_fallback_encoder))
         else:
-            cmd.extend(["-hwaccel", "auto"])
+            decode_attempts.append(("software decode with accurate seek", [], True, False, cpu_fallback_encoder))
 
-        cmd.extend(["-ss", str(start_time), "-i", video_file])
-        cmd.extend(["-vf", filter_complex])
-        cmd.extend(["-vframes", str(frame_count)])
-        cmd.extend(
-            build_standard_video_encode_args(
-                use_nvenc=use_nvenc,
-                gpu_encoder=gpu_encoder,
-                quality=quality,
-                threads_per_job=threads_per_job,
+        last_error = "FFmpeg extraction failed"
+
+        for attempt_index, (attempt_label, hwaccel_args, accurate_seek, attempt_use_nvenc, attempt_cpu_encoder) in enumerate(decode_attempts, start=1):
+            try:
+                if os.path.exists(output_file):
+                    os.remove(output_file)
+            except OSError:
+                pass
+
+            cmd = [FFMPEG_PATH]
+            cmd.extend(hwaccel_args)
+            if accurate_seek:
+                cmd.extend(["-i", video_file, "-ss", str(start_time), "-t", str(duration)])
+            else:
+                cmd.extend(["-ss", str(start_time), "-i", video_file, "-t", str(duration)])
+            cmd.extend(["-vf", filter_complex])
+            cmd.extend(["-vframes", str(frame_count)])
+            cmd.extend(
+                build_standard_video_encode_args(
+                    use_nvenc=attempt_use_nvenc,
+                    gpu_encoder=gpu_encoder,
+                    quality=quality,
+                    threads_per_job=threads_per_job,
+                    cpu_encoder=attempt_cpu_encoder,
+                )
             )
+            cmd.extend(
+                [
+                    "-an",
+                    "-vsync",
+                    "cfr",
+                    "-r",
+                    str(fps),
+                    "-fflags",
+                    "+genpts",
+                ]
+            )
+
+            if is_mp4_path(output_file):
+                cmd.extend(["-movflags", "+faststart"])
+
+            cmd.extend(["-y", output_file])
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    creationflags=creationflags,
+                )
+            except subprocess.TimeoutExpired:
+                last_error = f"{attempt_label} timed out after {timeout_seconds} seconds"
+            except Exception as exc:
+                last_error = f"{attempt_label} failed: {exc}"
+            else:
+                if result.returncode == 0 and has_valid_video_stream(output_file):
+                    recovery_label = attempt_label if attempt_index > 1 else None
+                    return True, recovery_label, None
+                if result.returncode == 0:
+                    last_error = f"{attempt_label} produced an output file without a valid video stream"
+                else:
+                    last_error = summarize_ffmpeg_error(
+                        result.stderr,
+                        f"{attempt_label} failed",
+                    )
+
+        failure_detail = (
+            f"{last_error} | source={os.path.basename(video_file)} | "
+            f"start={start_time:.3f}s | duration={duration:.3f}s"
         )
-        cmd.extend(
-            [
-                "-an",
-                "-vsync",
-                "cfr",
-                "-r",
-                str(fps),
-                "-fflags",
-                "+genpts",
-            ]
-        )
-
-        if is_mp4_path(output_file):
-            cmd.extend(["-movflags", "+faststart"])
-
-        cmd.extend(["-y", output_file])
-
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=180
-        )
-
-        if result.returncode != 0:
-            print(f"   FFmpeg error: {result.stderr}")
-            return False
-
-        if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
-            return False
-
-        return True
+        return False, None, failure_detail
 
     except Exception as e:
-        print(f"   Error extracting clip: {e}")
-        return False
+        return False, None, f"Error extracting clip: {e}"
 
 
 def extract_prores_segment_ffmpeg(
@@ -485,6 +655,8 @@ def extract_prores_segment_ffmpeg(
 ) -> str:
     """Extract a frame-accurate ProRes segment from a ProRes proxy source."""
     frame_count = seconds_to_frame_count(duration, fps)
+    timeout_seconds = get_segment_timeout_seconds(duration, reverse=reverse, prores=True)
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
     filters = []
     if speed_factor != 1.0:
@@ -492,8 +664,7 @@ def extract_prores_segment_ffmpeg(
     if reverse:
         filters.append("reverse")
     if target_size:
-        width, height = target_size
-        filters.append(f"scale={width}:{height}")
+        filters.extend(get_target_size_filters(target_size))
     filters.append(f"fps={fps}")
 
     cmd = [
@@ -504,6 +675,8 @@ def extract_prores_segment_ffmpeg(
         str(start_time),
         "-i",
         video_file,
+        "-t",
+        str(duration),
         "-vf",
         ",".join(filters),
         "-vframes",
@@ -527,16 +700,24 @@ def extract_prores_segment_ffmpeg(
 
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=180
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            creationflags=creationflags,
         )
 
         if result.returncode != 0:
-            raise Exception(f"Segment extraction failed: {result.stderr}")
+            raise Exception(
+                f"Segment extraction failed: {summarize_ffmpeg_error(result.stderr, 'unknown FFmpeg error')}"
+            )
 
         if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
             raise Exception(f"Segment file not created or is empty: {output_file}")
 
         return output_file
+    except subprocess.TimeoutExpired:
+        raise Exception(f"Segment extraction timed out after {timeout_seconds} seconds")
     except Exception as e:
         raise Exception(f"ProRes segment extraction error: {str(e)}")
 

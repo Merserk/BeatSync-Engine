@@ -9,34 +9,89 @@ The current workflow is local-path based. The GUI does not upload and duplicate 
 - Local-path workflow for lower disk usage and faster startup
 - Native Windows `Browse...` pickers for audio files and video folders
 - Manual, Smart, and Auto beat selection modes
+- Optional target resolution presets for 16:9, 21:9, and 9:16 outputs
+- Target resolution scaling preserves aspect ratio and pads to fit the selected frame
 - Frame-based segment planning for stable output duration
-- Standard H.264/NVENC export with chunked rendering and stream-copy assembly
+- Recursive video-folder scanning for `.mp4` and `.mkv` sources
+- Standard CPU, NVENC H.264, and NVENC HEVC export with chunked rendering and stream-copy assembly
 - ProRes 422 Proxy precise mode with browser-friendly preview generation
 - Optional ProRes secondary export: lossless delivery MP4
 - Boot-time GPU/NVENC runtime probing so unusable GPU paths fall back cleanly
 - Portable runtime support for Python, CUDA, and FFmpeg under `bin/`
+- Portable CUDA auto-discovery under `bin/CUDA/`, with `CUDA 12.9.x` recommended for Pascal GPUs such as the GTX 1080 Ti
+
+## Recent Changes
+
+- Replaced the old upload-style GUI flow with local path inputs and Windows `Browse...` buttons.
+- Stopped copying source audio and video into BeatSync session temp folders before processing.
+- Reworked standard CPU/NVENC exports to render at final quality and assemble with stream copy instead of doing a full final re-encode.
+- Added standard export quality presets: `fast`, `balanced`, and `high`.
+- Switched segment planning to cumulative frame boundaries to keep long outputs aligned more reliably.
+- Added boot-time CUDA and NVENC probing so the UI only exposes GPU paths when they are actually usable.
+- Added clean CPU fallback for beat analysis if a GPU path is detected but fails at runtime.
+- Added portable CUDA auto-discovery plus the `BEATSYNC_CUDA_DIR` override.
+- Downgraded the recommended Pascal-compatible portable CUDA line from `13.x` to `12.9.x`.
+- Added optional ProRes delivery MP4 generation while keeping the `.mov` master and H.264 preview flow.
+- Added recursive video-folder discovery for nested source libraries.
+- Added target resolution presets and switched resizing to aspect-ratio-safe fit-and-pad output.
+- Added browser-preview generation for non-browser-playable outputs such as HEVC and ProRes.
+- Hardened HEVC segment retries so recoverable failures fall back through safer decode/encode paths before a clip is skipped.
 
 ## Supported Media
 
 - Audio input: `.mp3`, `.wav`, `.flac`
-- Video source folder: `.mp4`, `.mkv`
+- Video source folder: `.mp4`, `.mkv` searched recursively through subfolders
 
 ## Portable Layout
 
 The repo expects these tools under `bin/`:
 
 - `bin/python-3.13.9-embed-amd64/python.exe`
-- `bin/CUDA/v13.0`
+- `bin/CUDA/v12.9.x` recommended, for example `bin/CUDA/v12.9` or `bin/CUDA/v12.9.1`
 - `bin/ffmpeg/ffmpeg.exe`
 - `bin/ffmpeg/ffprobe.exe`
 
-`run.bat`, `gui.py`, and `video_processor.py` are wired to those paths.
+Portable CUDA is discovered automatically under `bin/CUDA/`.
+The app prefers a folder matching the installed CuPy package line, for example:
+
+- `cupy-cuda12x` -> `bin/CUDA/v12.*`
+- `cupy-cuda13x` -> `bin/CUDA/v13.*`
+
+You can also override auto-detection with `BEATSYNC_CUDA_DIR`.
+For Pascal GPUs, prefer `CUDA 12.9.x` and `cupy-cuda12x==13.6.0`.
+
+Windows override example:
+
+```bat
+set BEATSYNC_CUDA_DIR=C:\Portable\CUDA\v12.9
+run.bat
+```
 
 ## Launching The App
 
 1. Place the portable runtime files under `bin/`.
 2. Run `run.bat`.
 3. The Gradio UI starts locally in your browser.
+
+## CUDA Notes
+
+- The current recommended portable toolkit line is `CUDA 12.9.x`.
+- This is the preferred line for Pascal GPUs such as the `GTX 1080 Ti`.
+- `CUDA 13.x` moves the architecture floor to Turing, so Pascal users should not rely on it for CuPy GPU analysis.
+- Keep only one CuPy CUDA package installed at a time.
+
+Recommended portable Python package swap:
+
+```bash
+bin\python-3.13.9-embed-amd64\python.exe -m pip uninstall -y cupy-cuda13x
+bin\python-3.13.9-embed-amd64\python.exe -m pip install cupy-cuda12x==13.6.0
+```
+
+Offline-friendly install from a downloaded wheel:
+
+```bash
+bin\python-3.13.9-embed-amd64\python.exe -m pip install path\to\cupy_cuda12x-13.6.0-cp313-cp313-win_amd64.whl
+```
 
 ## GUI Workflow
 
@@ -57,7 +112,7 @@ The repo expects these tools under `bin/`:
    - `balanced`
    - `high`
 6. In ProRes mode, you can optionally enable `Also create delivery MP4 (Lossless)` to keep the `.mov` master and create a second lossless `.mp4`.
-7. Optionally adjust direction, playback speed, timing offset, worker count, FPS, and output filename.
+7. Optionally adjust direction, playback speed, timing offset, target resolution, worker count, FPS, and output filename.
 8. Click `Create Music Video`.
 
 Finished files are written to `output/`.
@@ -99,6 +154,7 @@ ProRes mode is the quality-first path:
 - If CUDA is unavailable or unusable, audio analysis falls back to CPU automatically.
 - The app determines CPU-only mode at boot and only exposes GPU/NVENC paths when the runtime probe succeeds.
 - NVENC is not treated as available just because FFmpeg lists the encoder; BeatSync now performs a real startup probe.
+- Standard HEVC segment extraction can retry through software decode, accurate seek, and CPU encode fallback before a clip is treated as failed.
 - ProRes preview generation prefers CUDA/NVENC when the app is not in CPU-only mode, then falls back cleanly to CPU-compatible paths if needed.
 - The optional ProRes delivery MP4 is a secondary export, not a replacement for the `.mov` master.
 
@@ -159,6 +215,26 @@ Run `python video_processor.py -h` for the full argument list.
 ## Validation Notes
 
 - A workstation follow-up checklist for GPU/NVENC validation lives in `TEST_TODO.md`.
+
+## Workstation Status
+
+Status as of March 25, 2026:
+
+- Startup validation passed on the GTX 1080 Ti workstation: GPU detected, `CPU_ONLY_MODE=False`, and the NVENC startup probe passed.
+- The first workstation pass also confirmed the native `Browse...` buttons for audio files and video folders.
+- The original portable `CUDA 13.x` plus `cupy-cuda13x` stack failed during Auto Mode rhythm analysis on Pascal with a CuPy NVRTC architecture error.
+- The portable stack has now been moved to `bin/CUDA/v12.9` with `cupy-cuda12x==13.6.0`.
+- Workstation smoke tests now confirm CuPy JIT kernels and Manual, Smart, and Auto beat-analysis paths can run on GPU again under the CUDA 12 stack.
+- Full GUI export re-tests now pass on the downgraded stack for:
+  - Auto Mode with NVENC H.264
+  - Auto Mode with NVENC HEVC
+  - Smart Mode with NVENC
+  - Manual Mode with NVENC
+  - ProRes master export
+  - ProRes preview generation on the GPU-enabled workstation path
+- Mixed-aspect-ratio sources now render into the selected target frame with fit-and-pad instead of stretch.
+- HEVC mixed-source exports can still hit recoverable first-pass segment failures on some clips, but the retry chain now recovers those segments and the end-to-end export completes successfully.
+- The remaining workstation follow-up items are the unchecked entries in `TEST_TODO.md`, mainly around ProRes preview fallback, optional delivery MP4, longer-track sync checks, and custom-FPS coverage.
 
 ## License
 
