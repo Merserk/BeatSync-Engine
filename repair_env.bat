@@ -18,6 +18,7 @@ if not exist "%PYTHON%" (
 )
 
 echo [信息] 正在修复依赖版本（NumPy/Numba）...
+"%PYTHON%" -X utf8 dependency_guard.py --fix
 "%PYTHON%" -X utf8 -m pip install --upgrade pip
 "%PYTHON%" -X utf8 -m pip install -r "%SCRIPT_DIR%requirements.txt"
 

@@ -27,6 +27,19 @@ set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 set "PYTHONDONTWRITEBYTECODE=1"
 
+:: Auto-check and repair NumPy/Numba compatibility
+"%PYTHON%" -X utf8 dependency_guard.py --check
+if %errorlevel% neq 0 (
+  echo [Warning] Detected NumPy/Numba compatibility issue. Trying auto-repair...
+  "%PYTHON%" -X utf8 dependency_guard.py --fix
+  if %errorlevel% neq 0 (
+    echo [Error] Auto-repair failed.
+    echo Please run repair_env.bat manually after checking proxy/network settings.
+    pause
+    exit /b 1
+  )
+)
+
 :: Run
 echo Starting BeatSync Engine...
 "%PYTHON%" -X utf8 gui.py

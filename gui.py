@@ -62,6 +62,7 @@ else:
     print(f"⚠️  Portable Python not found, using system Python")
 
 # NOW import other modules (after CUDA environment is set)
+from dependency_guard import print_runtime_dependency_status
 import gradio as gr
 import librosa
 import tempfile
@@ -95,6 +96,8 @@ os.makedirs(GRADIO_TEMP_DIR, exist_ok=True)
 
 # Set environment variable for Gradio (but don't override tempfile.tempdir globally)
 os.environ['GRADIO_TEMP_DIR'] = GRADIO_TEMP_DIR
+
+print_runtime_dependency_status()
 
 # Prepare status strings for startup
 python_str_startup = "Portable" if USING_PORTABLE_PYTHON else "System"
