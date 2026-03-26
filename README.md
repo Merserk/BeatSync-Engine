@@ -138,9 +138,11 @@ This project stands on the shoulders of giants. A huge thank you to the develope
 If you see: `Numba needs NumPy 2.2 or less. Got NumPy 2.3`, `run.bat` now auto-checks and auto-repairs dependencies before launch.
 
 You can also run manual repair:
+If you see: `Numba needs NumPy 2.2 or less. Got NumPy 2.3`, run:
 
 ```bat
 repair_env.bat
 ```
 
 This project pins compatible versions in `requirements.txt` (`numpy<=2.2.2`, `numba<0.62`).
+This project now pins compatible versions in `requirements.txt` (`numpy<=2.2.2`, `numba<0.62`).
