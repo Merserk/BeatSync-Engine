@@ -62,6 +62,7 @@ else:
     print(f"⚠️  Portable Python not found, using system Python")
 
 # NOW import other modules (after CUDA environment is set)
+from dependency_guard import print_runtime_dependency_status
 import gradio as gr
 import librosa
 import tempfile
@@ -95,6 +96,8 @@ os.makedirs(GRADIO_TEMP_DIR, exist_ok=True)
 
 # Set environment variable for Gradio (but don't override tempfile.tempdir globally)
 os.environ['GRADIO_TEMP_DIR'] = GRADIO_TEMP_DIR
+
+print_runtime_dependency_status()
 
 # Prepare status strings for startup
 python_str_startup = "Portable" if USING_PORTABLE_PYTHON else "System"
@@ -167,12 +170,12 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     session_state['original_audio_path'] = audio_file
                     print(f"   ✓ Audio ready: {os.path.basename(local_audio_path)}")
                 else:
-                    return None, '❌ Error: Could not copy audio file', session_state
+                    return None, '❌ 错误：无法复制音频文件', session_state
             else:
                 local_audio_path = session_state.get('local_audio_path')
                 print(f"♻️  Reusing existing audio file")
         else:
-            return None, '❌ Error: No audio file uploaded', session_state
+            return None, '❌ 错误：未上传音频文件', session_state
 
         # Handle video files
         if video_files:
@@ -190,18 +193,18 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     session_state['original_video_paths'] = video_files
                     print(f"   ✓ {len(local_video_paths)} video(s) ready")
                 else:
-                    return None, '❌ Error: Could not copy video files', session_state
+                    return None, '❌ 错误：无法复制视频文件', session_state
             else:
                 local_video_paths = session_state.get('local_video_paths')
                 print(f"♻️  Reusing existing video files")
         else:
-            return None, '❌ Error: No valid video files uploaded', session_state
+            return None, '❌ 错误：未上传有效视频文件', session_state
 
         # Verify files exist
         if not local_audio_path or not os.path.exists(local_audio_path):
-             return None, f"❌ Error: Audio file is missing from session directory.", session_state
+             return None, f"❌ 错误：会话目录中缺少音频文件。", session_state
         if not local_video_paths or not all(p and os.path.exists(p) for p in local_video_paths):
-             return None, f"❌ Error: Video files are missing from session directory.", session_state
+             return None, f"❌ 错误：会话目录中缺少视频文件。", session_state
         
         # Set GPU mode
         use_gpu = is_gpu_available()
@@ -248,7 +251,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
         output_path = os.path.join(output_folder, filename)
         temp_output = os.path.join(session_dir, filename)
 
-        speed_factor = {'Half Speed': 0.5, 'Double Speed': 2.0}.get(playback_speed_str, 1.0)
+        speed_factor = {'half': 0.5, 'double': 2.0}.get(playback_speed_str, 1.0)
 
         print(f"\n{CONSOLE_SEPARATOR}")
         print(f"🎵 BEAT ANALYSIS - {mode_str} ({accel_str})")
@@ -301,17 +304,17 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
 
         # Generate status message based on mode
         gpu_info = f"⚡ GPU: {get_gpu_info()}" if use_gpu else "💻 CPU"
-        fps_info = f"{output_fps:.2f} FPS (custom)" if custom_fps else f"{output_fps:.2f} FPS (auto-detected)"
-        audio_info = "PCM 24-bit (48kHz)"
+        fps_info = f"{output_fps:.2f} FPS（自定义）" if custom_fps else f"{output_fps:.2f} FPS（自动检测）"
+        audio_info = "PCM 24-bit（48kHz）"
         
         if is_prores:
-            codec_info = "ProRes 422 Proxy (.mov) - Lossless"
+            codec_info = "ProRes 422 Proxy（.mov）- 无损"
             encoder_info = "🎯 Lossless Concatenation"
         elif use_nvenc:
             codec_info = f"{gpu_encoder.upper()} (.mp4)"
             encoder_info = f"⚡ {gpu_encoder.upper()}"
         else:
-            codec_info = "H.264 (.mp4)"
+            codec_info = "H.264（.mp4）"
             encoder_info = "💻 libx264"
 
         if generation_mode == 'smart':
@@ -366,7 +369,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
         return preview_path, status_msg, session_state
 
     except Exception as e:
-        error_msg = f"❌ Error: {str(e)}"
+        error_msg = f"❌ 错误：{str(e)}"
         import traceback
         traceback.print_exc()
         return None, error_msg, session_state
@@ -414,14 +417,14 @@ def create_ui() -> gr.Blocks:
         
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown('### 📁 Input Files')
+                gr.Markdown('### 📁 输入文件')
                 audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath')
                 video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=['.mp4', '.mkv'], type='filepath')
 
                 with gr.Group():
-                    gr.Markdown('### 🎯 Generation Mode')
+                    gr.Markdown('### 🎯 生成模式')
                     generation_mode = gr.Radio(
-                        choices=[('🤖 Auto Mode (Recommended)', 'auto'), ('🧠 Smart Mode', 'smart'), ('⚙️ Manual Mode', 'manual')],
+                        choices=[('🤖 自动模式（推荐）', 'auto'), ('🧠 智能模式', 'smart'), ('⚙️ 手动模式', 'manual')],
                         value='auto', label=LABEL_GENERATION_MODE, info=INFO_GENERATION_MODE
                     )
                     
@@ -433,7 +436,7 @@ def create_ui() -> gr.Blocks:
                     with smart_group:
                         gr.Markdown(SMART_MODE_DESCRIPTION)
                         smart_preset = gr.Radio(
-                            choices=['slower', 'slow', 'normal', 'fast', 'faster'], value='normal',
+                            choices=[('更慢', 'slower'), ('慢速', 'slow'), ('标准', 'normal'), ('快速', 'fast'), ('更快', 'faster')], value='normal',
                             label=LABEL_CUT_PRESET, info=INFO_CUT_PRESET
                         )
                     
@@ -446,33 +449,33 @@ def create_ui() -> gr.Blocks:
                         )
 
                 with gr.Group():
-                    gr.Markdown('### ⚙️ Video Settings')
-                    direction = gr.Radio(choices=['forward', 'backward', 'random'], value='forward', label=LABEL_DIRECTION, info=INFO_DIRECTION)
-                    playback_speed = gr.Radio(choices=['Normal Speed', 'Half Speed', 'Double Speed'], value='Normal Speed', label=LABEL_PLAYBACK_SPEED, info=INFO_PLAYBACK_SPEED)
+                    gr.Markdown('### ⚙️ 视频设置')
+                    direction = gr.Radio(choices=[('正放', 'forward'), ('倒放', 'backward'), ('随机', 'random')], value='forward', label=LABEL_DIRECTION, info=INFO_DIRECTION)
+                    playback_speed = gr.Radio(choices=[('正常速度', 'normal'), ('半速', 'half'), ('双倍速', 'double')], value='normal', label=LABEL_PLAYBACK_SPEED, info=INFO_PLAYBACK_SPEED)
                     timing_offset = gr.Slider(minimum=-0.5, maximum=0.5, value=0.0, step=0.01, label=LABEL_TIMING_OFFSET, info=INFO_TIMING_OFFSET)
                     custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
 
                 with gr.Group():
-                    gr.Markdown(f'### 🎬 Processing Mode')
+                    gr.Markdown('### 🎬 处理模式')
                     if NVENC_AVAILABLE:
-                        processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
+                        processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU（H.264）', 'cpu'), ('ProRes 422 Proxy（精确模式）', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
                     else:
-                        processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
+                        processing_mode = gr.Radio(choices=[('CPU（H.264）', 'cpu'), ('ProRes 422 Proxy（精确模式）', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
                 
                 with gr.Group():
-                    gr.Markdown(f'### ⚙️ Performance Settings')
+                    gr.Markdown('### ⚙️ 性能设置')
                     parallel_workers = gr.Slider(minimum=1, maximum=min(16, max(CPU_COUNT // 2, 4)), value=PARALLEL_WORKERS, step=1, label=get_parallel_workers_label(PARALLEL_WORKERS), info=get_parallel_workers_info())
 
                 with gr.Group():
-                    gr.Markdown('### 📁 Output Settings')
-                    output_filename = gr.Textbox(value='music_video.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
+                    gr.Markdown('### 📁 输出设置')
+                    output_filename = gr.Textbox(value='卡点视频.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
 
-                process_btn = gr.Button('🎬 Create Music Video', variant='primary', size='lg')
+                process_btn = gr.Button('🎬 生成音乐视频', variant='primary', size='lg')
 
             with gr.Column(scale=1):
-                gr.Markdown('### 📺 Output')
-                status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, is_gpu_available(), get_gpu_info(), NVENC_AVAILABLE), lines=16, max_lines=25)
-                video_output = gr.Video(label='Generated Music Video', interactive=False)
+                gr.Markdown('### 📺 输出结果')
+                status_output = gr.Textbox(label='状态', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, is_gpu_available(), get_gpu_info(), NVENC_AVAILABLE), lines=16, max_lines=25)
+                video_output = gr.Video(label='生成的视频', interactive=False)
                 
         def toggle_mode(mode):
             return {
@@ -509,10 +512,10 @@ if __name__ == '__main__':
     # Clean up old files only on startup
     cleanup_on_startup()
     
-    print(f"🌐 Starting Gradio interface...")
+    print(f"🌐 正在启动 Gradio 界面...")
     print(f"   URL: http://127.0.0.1:7860")
-    print(f"   Session persistence: ENABLED")
-    print(f"   Files kept until app restart")
+    print(f"   会话持久化：已启用")
+    print(f"   文件将在应用重启前保留")
     print(f"\n{CONSOLE_SEPARATOR}\n")
     
     app = create_ui()
