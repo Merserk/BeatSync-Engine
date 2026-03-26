@@ -14,6 +14,12 @@ import warnings
 # Determine script directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+from runtime_env import configure_portable_runtime
+
+RUNTIME = configure_portable_runtime(SCRIPT_DIR)
+if RUNTIME.cuda_notice:
+    print(f"Portable CUDA note: {RUNTIME.cuda_notice}")
+
 # GPU Support (optional for faster processing)
 try:
     import cupy as cp
@@ -23,6 +29,22 @@ except ImportError:
     cp = None
 
 warnings.filterwarnings('ignore')
+
+
+def _clear_cupy_memory() -> None:
+    """Release cached CuPy allocations after an optional GPU attempt."""
+    if cp is None:
+        return
+    try:
+        cp.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+
+
+def _summarize_exception(exc: Exception) -> str:
+    """Keep optional GPU fallback errors to a single readable line."""
+    message = str(exc).strip()
+    return message.splitlines()[0] if message else exc.__class__.__name__
 
 
 def analyze_beats_auto(audio_file: str, start_time: float = 0.0, 
@@ -98,6 +120,7 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         'rhythm_data': rhythm_data,
         'rhythm_patterns': rhythm_patterns,
         'selection_info': selection_info,
+        'analysis_device': rhythm_data.get('analysis_device', 'gpu' if use_gpu and GPU_AVAILABLE else 'cpu'),
         'mode': 'auto'
     }
     
@@ -130,49 +153,52 @@ def analyze_song_structure(y: np.ndarray, sr: int, beat_times: np.ndarray) -> Li
     Analyze song structure using spectral clustering.
     Identifies sections like intro, verse, chorus, bridge, outro.
     """
+    total_duration = len(y) / sr
+    feature_hop_length = 512
+
     try:
         # Compute chromagram for harmonic analysis
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512)
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=feature_hop_length)
         
         # Compute spectral features
-        spectral_contrast = librosa.feature.spectral_contrast(y=y, sr=sr, hop_length=512)
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=512)
+        spectral_contrast = librosa.feature.spectral_contrast(y=y, sr=sr, hop_length=feature_hop_length)
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=feature_hop_length)
         
         # Combine features
         features = np.vstack([chroma, spectral_contrast, mfcc])
-        
-        # Compute self-similarity matrix
-        rec_matrix = librosa.segment.recurrence_matrix(
-            features, 
-            mode='affinity',
-            metric='cosine',
-            bandwidth=3
-        )
-        
-        # Detect boundaries using distance_threshold instead of k
-        # This allows automatic determination of the number of sections
+        if features.shape[1] < 2:
+            raise ValueError("Not enough feature frames for structure clustering")
+
+        # Use a duration-based target section count that stays within the
+        # current librosa/sklearn agglomerative API requirements.
+        target_sections = int(round(total_duration / 20.0))
+        target_sections = max(2, min(8, target_sections))
+        target_sections = min(target_sections, features.shape[1])
+
         boundaries_frames = librosa.segment.agglomerative(
-            rec_matrix, 
-            k=None,
-            clusterer=None
+            features,
+            k=target_sections,
         )
-        
-        # If that fails, use a simpler approach
+
         if boundaries_frames is None or len(boundaries_frames) == 0:
             raise ValueError("Agglomerative clustering failed")
+
+        boundaries_frames = np.unique(boundaries_frames.astype(int))
+        if boundaries_frames[0] != 0:
+            boundaries_frames = np.concatenate([[0], boundaries_frames])
             
     except Exception as e:
         print(f"      ⚠️ Advanced structure analysis failed: {e}")
         print(f"      → Using fallback: onset-based segmentation")
         
         # Fallback: Use onset-based segmentation
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=512)
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=feature_hop_length)
         
         # Detect strong changes in onset strength
         onset_frames = librosa.onset.onset_detect(
             onset_envelope=onset_env,
             sr=sr,
-            hop_length=512,
+            hop_length=feature_hop_length,
             backtrack=False,
             pre_max=20,
             post_max=20,
@@ -183,7 +209,6 @@ def analyze_song_structure(y: np.ndarray, sr: int, beat_times: np.ndarray) -> Li
         )
         
         # Use every Nth onset as a boundary (to get ~4-8 sections)
-        total_duration = len(y) / sr
         target_sections = max(4, min(8, int(total_duration / 20)))  # 1 section per ~20 seconds
         
         if len(onset_frames) > target_sections:
@@ -195,11 +220,10 @@ def analyze_song_structure(y: np.ndarray, sr: int, beat_times: np.ndarray) -> Li
         # Always include start and end
         boundaries_frames = np.unique(np.concatenate([[0], boundaries_frames, [len(onset_env) - 1]]))
     
-    boundaries_times = librosa.frames_to_time(boundaries_frames, sr=sr, hop_length=512)
+    boundaries_times = librosa.frames_to_time(boundaries_frames, sr=sr, hop_length=feature_hop_length)
     
     # Create section information
     sections = []
-    total_duration = len(y) / sr
     
     for i in range(len(boundaries_times)):
         start_time = boundaries_times[i]
@@ -293,46 +317,52 @@ def analyze_multi_band_rhythm(y: np.ndarray, sr: int, beat_times: np.ndarray, us
     Analyze rhythm across multiple frequency bands.
     Kick (20-150 Hz), Clap/Snare (150-4000 Hz), Hi-hat (4000+ Hz), Bass (20-200 Hz)
     """
-    # Use GPU if available
-    xp = cp if (use_gpu and GPU_AVAILABLE) else np
-    
-    # Compute STFT
-    stft = librosa.stft(y, n_fft=2048, hop_length=512)
+    analysis_on_gpu = False
+
     if use_gpu and GPU_AVAILABLE:
-        stft = cp.asarray(stft)
-    
-    # Frequency bins
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
-    if use_gpu and GPU_AVAILABLE:
-        freqs = cp.asarray(freqs)
-    
-    # Define frequency bands
-    kick_band = (freqs >= 20) & (freqs <= 150)
-    clap_band = (freqs >= 150) & (freqs <= 4000)
-    hihat_band = freqs >= 4000
-    bass_band = (freqs >= 20) & (freqs <= 200)
-    
-    # Extract onset envelopes for each band
-    kick_onset = xp.sum(xp.abs(stft[kick_band, :]), axis=0)
-    clap_onset = xp.sum(xp.abs(stft[clap_band, :]), axis=0)
-    hihat_onset = xp.sum(xp.abs(stft[hihat_band, :]), axis=0)
-    bass_onset = xp.sum(xp.abs(stft[bass_band, :]), axis=0)
-    
-    # Normalize
-    kick_onset = kick_onset / (xp.max(kick_onset) + 1e-6)
-    clap_onset = clap_onset / (xp.max(clap_onset) + 1e-6)
-    hihat_onset = hihat_onset / (xp.max(hihat_onset) + 1e-6)
-    bass_onset = bass_onset / (xp.max(bass_onset) + 1e-6)
-    
-    # Convert back to CPU if using GPU
-    if use_gpu and GPU_AVAILABLE:
-        kick_onset = cp.asnumpy(kick_onset)
-        clap_onset = cp.asnumpy(clap_onset)
-        hihat_onset = cp.asnumpy(hihat_onset)
-        bass_onset = cp.asnumpy(bass_onset)
-        
-        # Clear GPU memory
-        cp.get_default_memory_pool().free_all_blocks()
+        try:
+            stft = cp.asarray(librosa.stft(y, n_fft=2048, hop_length=512))
+            freqs = cp.asarray(librosa.fft_frequencies(sr=sr, n_fft=2048))
+
+            kick_band = (freqs >= 20) & (freqs <= 150)
+            clap_band = (freqs >= 150) & (freqs <= 4000)
+            hihat_band = freqs >= 4000
+            bass_band = (freqs >= 20) & (freqs <= 200)
+
+            kick_onset = cp.sum(cp.abs(stft[kick_band, :]), axis=0)
+            clap_onset = cp.sum(cp.abs(stft[clap_band, :]), axis=0)
+            hihat_onset = cp.sum(cp.abs(stft[hihat_band, :]), axis=0)
+            bass_onset = cp.sum(cp.abs(stft[bass_band, :]), axis=0)
+
+            kick_onset = cp.asnumpy(kick_onset / (cp.max(kick_onset) + 1e-6))
+            clap_onset = cp.asnumpy(clap_onset / (cp.max(clap_onset) + 1e-6))
+            hihat_onset = cp.asnumpy(hihat_onset / (cp.max(hihat_onset) + 1e-6))
+            bass_onset = cp.asnumpy(bass_onset / (cp.max(bass_onset) + 1e-6))
+            analysis_on_gpu = True
+        except Exception as exc:
+            print(f"      GPU rhythm analysis failed: {_summarize_exception(exc)}")
+            print("      Falling back to CPU rhythm analysis")
+        finally:
+            _clear_cupy_memory()
+
+    if not analysis_on_gpu:
+        stft = librosa.stft(y, n_fft=2048, hop_length=512)
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+
+        kick_band = (freqs >= 20) & (freqs <= 150)
+        clap_band = (freqs >= 150) & (freqs <= 4000)
+        hihat_band = freqs >= 4000
+        bass_band = (freqs >= 20) & (freqs <= 200)
+
+        kick_onset = np.sum(np.abs(stft[kick_band, :]), axis=0)
+        clap_onset = np.sum(np.abs(stft[clap_band, :]), axis=0)
+        hihat_onset = np.sum(np.abs(stft[hihat_band, :]), axis=0)
+        bass_onset = np.sum(np.abs(stft[bass_band, :]), axis=0)
+
+        kick_onset = kick_onset / (np.max(kick_onset) + 1e-6)
+        clap_onset = clap_onset / (np.max(clap_onset) + 1e-6)
+        hihat_onset = hihat_onset / (np.max(hihat_onset) + 1e-6)
+        bass_onset = bass_onset / (np.max(bass_onset) + 1e-6)
     
     # Sample strength at each beat
     beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=512)
@@ -387,7 +417,8 @@ def analyze_multi_band_rhythm(y: np.ndarray, sr: int, beat_times: np.ndarray, us
         'is_strong_kick': is_strong_kick,
         'is_strong_clap': is_strong_clap,
         'is_strong_hihat': is_strong_hihat,
-        'is_strong_bass': is_strong_bass
+        'is_strong_bass': is_strong_bass,
+        'analysis_device': 'gpu' if analysis_on_gpu else 'cpu'
     }
 
 
