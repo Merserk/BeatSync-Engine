@@ -3,3 +3,5 @@ __pycache__/
 .vscode/
 /temp/
 /output/
+PR_DESCRIPTION.md
+TEST_TODO.md
