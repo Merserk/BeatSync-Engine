@@ -1,0 +1,8 @@
+# BeatSync Engine runtime dependencies
+# Pin NumPy to <=2.2 to keep Numba compatibility.
+numpy<=2.2.2
+numba>=0.61,<0.62
+librosa>=0.11,<0.12
+gradio>=5,<6
+soundfile>=0.12
+scipy>=1.13
