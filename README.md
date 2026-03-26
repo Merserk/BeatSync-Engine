@@ -130,3 +130,15 @@ Run `python video_processor.py -h` for a full list of commands and options.
 
 ## ❤️ Acknowledgments
 This project stands on the shoulders of giants. A huge thank you to the developers of the incredible open-source libraries that make BeatSync Engine possible.
+
+
+## 🧯 Troubleshooting
+
+### Numba / NumPy version conflict
+If you see: `Numba needs NumPy 2.2 or less. Got NumPy 2.3`, run:
+
+```bat
+repair_env.bat
+```
+
+This project now pins compatible versions in `requirements.txt` (`numpy<=2.2.2`, `numba<0.62`).
