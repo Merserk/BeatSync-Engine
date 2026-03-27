@@ -3,4 +3,6 @@ __pycache__/
 .vscode/
 temp/
 output/
-dev/
+dev/*
+!dev/PR_DESCRIPTION_27.03.26.md
+!dev/test_regression.py

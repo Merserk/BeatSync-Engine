@@ -6,6 +6,7 @@ The current workflow is local-path based. The GUI does not upload and duplicate 
 
 ## Highlights
 
+- Dark, application-style Gradio workspace tuned for desktop use
 - Local-path workflow for lower disk usage and faster startup
 - Native Windows `Browse...` pickers for audio files and video folders
 - Manual, Smart, and Auto beat selection modes
@@ -16,6 +17,7 @@ The current workflow is local-path based. The GUI does not upload and duplicate 
 - Standard CPU, NVENC H.264, and NVENC HEVC export with chunked rendering and stream-copy assembly
 - ProRes 422 Proxy precise mode with browser-friendly preview generation
 - Optional ProRes secondary export: lossless delivery MP4
+- Immediate render-start feedback: the main action switches to `Creating...` while a job is running
 - Boot-time GPU/NVENC runtime probing so unusable GPU paths fall back cleanly
 - Portable runtime support for Python, CUDA, and FFmpeg under `bin/`
 - Portable CUDA auto-discovery under `bin/CUDA/`, with `CUDA 12.9.x` recommended for Pascal GPUs such as the GTX 1080 Ti
@@ -36,6 +38,10 @@ The current workflow is local-path based. The GUI does not upload and duplicate 
 - Added target resolution presets and switched resizing to aspect-ratio-safe fit-and-pad output.
 - Added browser-preview generation for non-browser-playable outputs such as HEVC and ProRes.
 - Hardened HEVC segment retries so recoverable failures fall back through safer decode/encode paths before a clip is skipped.
+- Reworked the GUI into a darker application-style layout with improved contrast and cleaner workflow grouping.
+- Removed Gradio settings/API chrome from the visible app surface.
+- Changed the ProRes delivery-copy selector to a deterministic `Yes / No` control.
+- Added immediate render-start feedback on `Create Music Video`.
 
 ## Supported Media
 
@@ -111,11 +117,28 @@ bin\python-3.13.9-embed-amd64\python.exe -m pip install path\to\cupy_cuda12x-13.
    - `fast`
    - `balanced`
    - `high`
-6. In ProRes mode, you can optionally enable `Also create delivery MP4 (Lossless)` to keep the `.mov` master and create a second lossless `.mp4`.
+6. In ProRes mode, set `Also create delivery MP4 (Lossless)` to `Yes` if you want to keep the `.mov` master and create a second lossless `.mp4`.
 7. Optionally adjust direction, playback speed, timing offset, target resolution, worker count, FPS, and output filename.
-8. Click `Create Music Video`.
+8. Click `Create Music Video`. The button switches to `Creating...` immediately so the render start is visible before processing completes.
 
 Finished files are written to `output/`.
+
+## Regression Testing
+
+Run the current regression suite with the portable runtime:
+
+```bash
+bin\python-3.13.9-embed-amd64\python.exe -m unittest discover -s dev -p "test_*.py" -v
+```
+
+The suite covers:
+
+- Gradio UI construction
+- Processing-mode UI state changes
+- Render-start button feedback
+- Source preflight summary behavior
+- Standard delivery orchestration
+- ProRes master plus optional delivery MP4 orchestration
 
 ## Processing Pipelines
 
