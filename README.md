@@ -1,4 +1,4 @@
-# 🎵 BeatSync Engine - AI Audio-Visual Music Video Generator
+# BeatSync Engine - AI Audio-Visual Music Video Generator
 
 [![Windows](https://img.shields.io/badge/Platform-Windows-0078D4?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Python](https://img.shields.io/badge/Python-Portable%203.13-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
