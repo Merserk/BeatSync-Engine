@@ -7,8 +7,8 @@ set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
 :: Set paths
-set "PYTHON=%SCRIPT_DIR%bin\python-3.13.13-embed-amd64\python.exe"
-set "CUDA=%SCRIPT_DIR%bin\CUDA\v13.2"
+set "PYTHON=%SCRIPT_DIR%bin\python-3.13.9-embed-amd64\python.exe"
+set "CUDA=%SCRIPT_DIR%bin\CUDA\v13.0"
 
 :: Environment
 set "CUDA_PATH=%CUDA%"
@@ -17,9 +17,9 @@ set "PATH=%CUDA%\bin\x64;%CUDA%\lib\x64;%PATH%"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 set "PYTHONDONTWRITEBYTECODE=1"
-set "PYTHONPATH=%SCRIPT_DIR%src"
 
 :: Run
-"%PYTHON%" -X utf8 src\gui.py
+echo Starting Music Video Cutter...
+"%PYTHON%" -X utf8 gui.py
 
 pause
