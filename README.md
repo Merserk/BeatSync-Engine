@@ -21,6 +21,14 @@ BeatSync Engine analyzes music rhythm, energy, sections, and source-video moment
 
 ---
 
+## 🎥 Demo Video
+
+[![Watch the BeatSync Engine demo video](https://img.youtube.com/vi/Iv00-5GkoOM/maxresdefault.jpg)](https://www.youtube.com/watch?v=Iv00-5GkoOM)
+
+> Watch the special showcase video for BeatSync Engine on YouTube.
+
+---
+
 ## ✨ Features
 
 *   **🎵 Automatic Beat Editing:** Detects a stable beat grid and cuts source footage to the music rhythm.
