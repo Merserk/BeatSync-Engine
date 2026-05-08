@@ -33,7 +33,7 @@ from logger import ROOT_DIR, setup_environment
 
 setup_environment()
 
-ANALYSIS_VERSION = "auto_av_analysis_v5_vllm_autostart"
+ANALYSIS_VERSION = "auto_av_analysis_v6_transformers"
 DEFAULT_QWEN_MODEL_DIR = os.path.join(ROOT_DIR, "bin", "models", "Qwen3-VL-2B-Instruct")
 VIDEO_ANALYSIS_CACHE_DIR = os.path.join(ROOT_DIR, "input", "video_analysis_cache")
 
@@ -317,6 +317,7 @@ def analyze_video_sources(
     qwen_tag_count = sum(int((v.get("timings") or {}).get("qwen_tag_count", 0)) for v in videos)
     qwen_frame_count = sum(int((v.get("timings") or {}).get("qwen_frame_count", 0)) for v in videos)
     qwen_seconds = sum(float((v.get("timings") or {}).get("qwen_seconds", 0.0)) for v in videos)
+    qwen_inference_seconds = sum(float((v.get("timings") or {}).get("qwen_inference_seconds", 0.0)) for v in videos)
     qwen_model_id = next(
         (
             str((v.get("timings") or {}).get("qwen_model_id"))
@@ -332,6 +333,9 @@ def analyze_video_sources(
             if (v.get("timings") or {}).get("qwen_concurrency")
         ),
         0,
+    )
+    qwen_peak_vram_gb = max(
+        [float((v.get("timings") or {}).get("qwen_peak_vram_gb") or 0.0) for v in videos] or [0.0]
     )
     print(
         f"   Visual library ready: {summary} "
@@ -351,8 +355,10 @@ def analyze_video_sources(
         "qwen_tag_count": qwen_tag_count,
         "qwen_frame_count": qwen_frame_count,
         "qwen_seconds": qwen_seconds,
+        "qwen_inference_seconds": qwen_inference_seconds,
         "qwen_model_id": qwen_model_id,
         "qwen_concurrency": qwen_concurrency,
+        "qwen_peak_vram_gb": qwen_peak_vram_gb,
     }
 
 
@@ -610,13 +616,14 @@ def _complete_deferred_qwen_batch(
         for video_data in job_to_video.values():
             video_data["ai_deferred"] = False
             video_data["ai_enabled"] = False
-        print("      Qwen/vLLM returned no semantic response; AI analysis will retry on the next run.")
+        print("      Qwen Transformers returned no semantic response; AI analysis will retry on the next run.")
         print(f"      ⏱ Shared Qwen batch total: {_fmt_seconds(batch_seconds)}")
         return
     model_load_seconds = float(response.get("model_load_seconds") or 0.0)
     amortized_model = model_load_seconds / max(1, len(request_jobs))
     qwen_model_id = str(response.get("model_id") or "")
     qwen_concurrency = int(response.get("batch_size") or 0)
+    qwen_peak_vram_gb = float(response.get("peak_vram_gb") or 0.0)
 
     for job_id, video_data in job_to_video.items():
         ai_candidates = selected_by_job.get(job_id, [])
@@ -645,6 +652,7 @@ def _complete_deferred_qwen_batch(
         timings["qwen_tag_count"] = int(timing.get("tag_count") or merged_count)
         timings["qwen_model_id"] = qwen_model_id
         timings["qwen_concurrency"] = qwen_concurrency
+        timings["qwen_peak_vram_gb"] = qwen_peak_vram_gb
         timings["total_seconds"] = float(timings.get("total_seconds", video_data.get("analysis_seconds", 0.0))) + qwen_seconds
         video_data["analysis_seconds"] = timings["total_seconds"]
         video_data["ai_deferred"] = False
@@ -715,12 +723,10 @@ def _run_qwen_worker_batch(
         print(f"      Qwen batch worker error: {e}")
         return {}
     finally:
-        for path in (request_path, response_path):
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError:
-                pass
+        # Keep Qwen worker request/response files in video_analysis_cache for
+        # reproducibility and debugging. The user explicitly wants this cache
+        # folder to be preserved.
+        pass
 
 def _build_boundaries(scene_changes: Iterable[float], duration: float) -> List[float]:
     if duration <= 0:
@@ -1229,6 +1235,7 @@ def _annotate_candidates_with_qwen(
             "qwen_tag_count": 0,
             "qwen_model_id": str(response.get("model_id") or "") if isinstance(response, dict) else "",
             "qwen_concurrency": int(response.get("batch_size") or 0) if isinstance(response, dict) else 0,
+            "qwen_peak_vram_gb": float(response.get("peak_vram_gb") or 0.0) if isinstance(response, dict) else 0.0,
         }
 
     semantic_by_id = {str(k): v for k, v in semantics.items()}
@@ -1245,6 +1252,7 @@ def _annotate_candidates_with_qwen(
         "qwen_tag_count": int(timing.get("tag_count") or merged_count),
         "qwen_model_id": str(response.get("model_id") or "") if isinstance(response, dict) else "",
         "qwen_concurrency": int(response.get("batch_size") or 0) if isinstance(response, dict) else 0,
+        "qwen_peak_vram_gb": float(response.get("peak_vram_gb") or 0.0) if isinstance(response, dict) else 0.0,
     }
 
 
@@ -1309,17 +1317,21 @@ def _run_qwen_worker(
         print(f"      Qwen worker error: {e}")
         return {}
     finally:
-        for path in (request_path, response_path):
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError:
-                pass
+        # Keep Qwen worker request/response files in video_analysis_cache for
+        # reproducibility and debugging. The user explicitly wants this cache
+        # folder to be preserved.
+        pass
 
 
 def _qwen_worker_environment() -> Dict[str, str]:
     env = os.environ.copy()
-    cuda_root = os.path.normcase(os.path.join(ROOT_DIR, "bin", "CUDA", "v13.2"))
+    cuda_dir = os.path.join(ROOT_DIR, "bin", "CUDA", "v13.0")
+    cuda_root = os.path.normcase(cuda_dir)
+    cuda_parts = [
+        os.path.join(cuda_dir, "bin", "x64"),
+        os.path.join(cuda_dir, "bin"),
+        os.path.join(cuda_dir, "lib", "x64"),
+    ]
     path_parts = []
     for part in env.get("PATH", "").split(os.pathsep):
         if not part:
@@ -1328,9 +1340,10 @@ def _qwen_worker_environment() -> Dict[str, str]:
         if norm.startswith(cuda_root):
             continue
         path_parts.append(part)
-    env["PATH"] = os.pathsep.join(path_parts)
-    for key in ("CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"):
-        env.pop(key, None)
+    env["PATH"] = os.pathsep.join(cuda_parts + path_parts)
+    env["CUDA_PATH"] = cuda_dir
+    env["CUDA_HOME"] = cuda_dir
+    env["CUDA_ROOT"] = cuda_dir
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     return env

@@ -27,7 +27,7 @@ def get_system_performance_info(cpu_count, max_threads, parallel_workers, python
 - **Parallel Processing**: {parallel_workers} workers | **Input**: Local project folder"""
 
 PORTABLE_SETUP_INFO = """## 📦 Portable Setup
-Self-contained installation - Python 3.13.13, CUDA 13.2, and FFmpeg included. 
+Self-contained installation - Python 3.13.13, CUDA 13.0, and FFmpeg included. 
 No system dependencies required."""
 
 GPU_ACCELERATION_INFO = """## ⚡ GPU Acceleration
@@ -177,7 +177,7 @@ GPU: {gpu_status}{gpu_device} | NVENC: {nvenc_status}
 
 **Files:**
 - Python: `bin/python-3.13.13-embed-amd64/`
-- CUDA: `bin/CUDA/v13.2/`
+- CUDA: `bin/CUDA/v13.0/`
 - FFmpeg: `bin/ffmpeg/ffmpeg.exe`
 - Temp: `./temp/` (local only)
 - Output: `./output/`

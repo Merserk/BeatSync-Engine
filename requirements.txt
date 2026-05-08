@@ -1,0 +1,9 @@
+gradio==6.14.0
+accelerate>=1.13.0
+transformers==5.8.0
+safetensors==0.7.0
+librosa==0.11.0
+numpy==2.4.4
+opencv-python-headless==4.13.0.92
+pillow==12.2.0
+cupy-cuda13x==14.0.1

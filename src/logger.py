@@ -16,7 +16,7 @@ ROOT_DIR = os.path.dirname(SRC_DIR)
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-PORTABLE_CUDA_DIR = os.path.join(ROOT_DIR, 'bin', 'CUDA', 'v13.2')
+PORTABLE_CUDA_DIR = os.path.join(ROOT_DIR, 'bin', 'CUDA', 'v13.0')
 PORTABLE_PYTHON_DIR = os.path.join(ROOT_DIR, 'bin', 'python-3.13.13-embed-amd64')
 FFMPEG_BIN_DIR = os.path.join(ROOT_DIR, 'bin', 'ffmpeg')
 FFMPEG_EXE = os.path.join(FFMPEG_BIN_DIR, 'ffmpeg.exe')
@@ -123,7 +123,7 @@ def print_startup_banner():
     python_type = "Portable" if USING_PORTABLE_PYTHON else "System"
     print(f"   Python: {python_type} ({sys.version.split()[0]})")
     
-    cuda_type = "Portable (v13.2)" if gpu['is_portable'] else "System"
+    cuda_type = "Portable (v13.0)" if gpu['is_portable'] else "System"
     if gpu['available']:
         print(f"   CUDA: {cuda_type} | Runtime: {gpu['cuda_version']}")
         print(f"   GPU: {gpu['name']}")

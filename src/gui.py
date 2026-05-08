@@ -9,7 +9,7 @@ if current_dir not in sys.path:
 
 
 def _install_windows_asyncio_connection_reset_filter() -> None:
-    """Hide benign Windows asyncio pipe resets after browser/vLLM shutdown.
+    """Hide benign Windows asyncio pipe resets after browser/subprocess shutdown.
 
     On Windows, asyncio's Proactor transport can log a scary traceback when a
     local socket or subprocess pipe is closed by the other side after the real
@@ -81,7 +81,6 @@ import threading
 import time
 import socket
 from typing import Callable, Iterator, TypeAlias, Tuple, Dict, List
-from urllib.parse import urlparse
 
 # Import FFmpeg processing module
 from ffmpeg_processing import get_video_fps, FFMPEG_PATH
@@ -231,17 +230,29 @@ def _stage5_summary(console_logger: StageConsoleLogger | None, video_analysis: D
     qwen_total = int(video_analysis.get("qwen_frame_count") or 0)
     qwen_tags = int(video_analysis.get("qwen_tag_count") or 0)
     model_id = _short_model_name(video_analysis.get("qwen_model_id"))
-    concurrency = int(video_analysis.get("qwen_concurrency") or 0)
+    batch_size = int(video_analysis.get("qwen_concurrency") or 0)
 
     console_logger.line(f"Source videos: {source_count}, visual workers: {worker_count}")
     if ai_enabled:
         qwen_bits = ["Qwen: enabled"]
         if model_id:
             qwen_bits.append(f"model {model_id}")
-        if concurrency:
-            qwen_bits.append(f"concurrency {concurrency}")
+        if batch_size:
+            qwen_bits.append(f"batch {batch_size}")
         console_logger.line(", ".join(qwen_bits))
         if qwen_total:
+            inference_seconds = float(video_analysis.get("qwen_inference_seconds") or video_analysis.get("qwen_seconds") or 0.0)
+            qwen_rate = (qwen_total / inference_seconds) if inference_seconds > 0 else 0.0
+            peak_vram = float(video_analysis.get("qwen_peak_vram_gb") or 0.0)
+            perf_bits = []
+            if batch_size:
+                perf_bits.append(f"batch {batch_size}")
+            if peak_vram > 0:
+                perf_bits.append(f"~{peak_vram:.2f} GB VRAM")
+            if qwen_rate > 0:
+                perf_bits.append(f"{qwen_rate:.2f} candidates/s")
+            if perf_bits:
+                console_logger.line(f"Qwen performance: {', '.join(perf_bits)}")
             console_logger.line(
                 f"Qwen tags: {qwen_tags}/{qwen_total} in {_fmt_stage_seconds(video_analysis.get('qwen_seconds'))}"
             )
@@ -322,140 +333,21 @@ def find_launch_port(default_port: int = 7860, search_limit: int = 20) -> int:
     raise OSError(f"Cannot find empty port in range: {default_port}-{default_port + search_limit - 1}")
 
 
-def _local_vllm_port() -> int | None:
-    base_url = os.environ.get("BEATSYNC_VLLM_BASE_URL") or os.environ.get("VLLM_OPENAI_BASE_URL")
-    if base_url:
-        parsed = urlparse(base_url)
-        host = (parsed.hostname or "").lower()
-        if host not in {"127.0.0.1", "localhost", "::1"}:
-            return None
-        try:
-            return int(parsed.port or os.environ.get("BEATSYNC_VLLM_PORT", "8000"))
-        except ValueError:
-            return 8000
-    try:
-        return int(os.environ.get("BEATSYNC_VLLM_PORT", "8000"))
-    except ValueError:
-        return 8000
-
-
-def _vllm_pid_for_port(port: int) -> int | None:
-    if os.name != "nt":
+def _as_existing_source_path(file_path: str | None) -> str | None:
+    """Use the selected source file directly instead of copying it locally."""
+    if not file_path:
         return None
-    result = subprocess.run(
-        ["netstat", "-ano", "-p", "tcp"],
-        capture_output=True,
-        text=True,
-        errors="replace",
-        check=False,
-    )
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[3].upper() == "LISTENING":
-            local_addr = parts[1]
-            if local_addr.endswith(f":{port}"):
-                try:
-                    return int(parts[-1])
-                except ValueError:
-                    return None
-    return None
-
-
-def _is_bundled_vllm_process(pid: int) -> bool:
-    if os.name != "nt":
-        return False
-    command = [
-        "powershell",
-        "-NoProfile",
-        "-Command",
-        f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine",
-    ]
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        errors="replace",
-        check=False,
-    )
-    command_line = (result.stdout or "").lower()
-    root_dir = os.path.dirname(current_dir)
-    bundled_python = os.path.join(root_dir, "bin", "vllm", "python-3.12.10-embed-amd64", "python.exe").lower()
-    return (
-        "vllm.entrypoints.openai.api_server" in command_line
-        and bundled_python in command_line
-    )
-
-
-def _wait_for_vllm_port_close(port: int, timeout: float = 8.0) -> None:
-    """Wait briefly until the local vLLM listener is gone so VRAM can release."""
-    deadline = time.perf_counter() + max(0.0, float(timeout))
-    while time.perf_counter() < deadline:
-        if _vllm_pid_for_port(port) is None:
-            return
-        time.sleep(0.25)
-
-
-def stop_local_vllm_server(wait: bool = True) -> bool:
-    """Stop only BeatSync's bundled local vLLM server.
-
-    The render stage also uses GPU/NVENC memory, so this is called immediately
-    after Stage 5 finishes Qwen semantic analysis instead of waiting until the
-    entire job ends. External/user-managed vLLM servers are left untouched.
-    """
-    port = _local_vllm_port()
-    if port is None:
-        return False
-    pid = _vllm_pid_for_port(port)
-    if not pid:
-        return False
-    if not _is_bundled_vllm_process(pid):
-        print(f"   ⚠️  Leaving non-bundled listener on port {port} running (PID {pid}).")
-        return False
-
-    subprocess.run(
-        ["taskkill", "/PID", str(pid), "/T", "/F"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if wait:
-        _wait_for_vllm_port_close(port)
-    return True
-
-
-def save_input_file(file_path: str, category: str) -> str:
-    """
-    Save uploaded file to input/audio or input/video.
-    Clears the existing files in that category first to keep only the latest.
-    """
-    if not file_path or not os.path.exists(file_path):
-        return None
-    
-    # Determine target directory
-    if category == 'audio':
-        target_dir = get_audio_input_dir()
-    else:
-        target_dir = get_video_input_dir()
-    
-    # 🧹 CLEANUP: Remove old files in this category folder
     try:
-        for item in os.listdir(target_dir):
-            item_path = os.path.join(target_dir, item)
-            if os.path.isfile(item_path):
-                os.remove(item_path)
-    except Exception as e:
-        print(f"   ⚠️  Warning during cleanup: {e}")
-    
-    # 📥 COPY: Save new file
-    filename = os.path.basename(file_path)
-    local_path = os.path.join(target_dir, filename)
-    
-    try:
-        shutil.copy2(file_path, local_path)
-        return local_path
-    except Exception as e:
-        print(f"   ⚠️  Error saving {filename}: {e}")
+        path = os.path.abspath(os.fspath(file_path))
+    except TypeError:
         return None
+    return path if os.path.isfile(path) else None
+
+
+def _as_existing_source_paths(file_paths: VideoFilesInput) -> list[str]:
+    if not file_paths:
+        return []
+    return [path for path in (_as_existing_source_path(p) for p in file_paths) if path]
 
 
 def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
@@ -463,8 +355,6 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        custom_fps: float, session_state: dict,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None) -> StatusResult:
-    processing_started = False
-    vllm_stopped_after_stage5 = False
     total_started = time.perf_counter()
     try:
         parallel_workers = PARALLEL_WORKERS
@@ -477,54 +367,39 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             session_state['session_dir'] = tempfile.mkdtemp(prefix='beatsync_', dir=GRADIO_TEMP_DIR)
         session_dir = session_state['session_dir']
 
-        # Handle audio file (Keep only the latest)
+        # Handle audio by referencing the selected file path directly.
         if audio_file:
             if audio_file != session_state.get('original_audio_path'):
-                local_audio_path = save_input_file(audio_file, 'audio')
+                local_audio_path = _as_existing_source_path(audio_file)
                 if local_audio_path:
                     session_state['local_audio_path'] = local_audio_path
                     session_state['original_audio_path'] = audio_file
                 else:
-                    return None, '❌ Error: Could not save audio file', session_state
+                    return None, '❌ Error: Could not access audio file', session_state
             else:
                 local_audio_path = session_state.get('local_audio_path')
         else:
-            return None, '❌ Error: No audio file uploaded', session_state
+            return None, '❌ Error: No audio file selected', session_state
 
-        # Handle video files (Keep only the latest set)
+        # Handle videos by referencing selected file paths directly.
         if video_files:
             if video_files != session_state.get('original_video_paths'):
-                # Clear video folder once before adding the new set
-                target_video_dir = get_video_input_dir()
-                for item in os.listdir(target_video_dir):
-                    item_path = os.path.join(target_video_dir, item)
-                    if os.path.isfile(item_path):
-                        os.remove(item_path)
-                
-                local_video_paths = []
-                for vf in video_files:
-                    if vf:
-                        # Copy without clearing again (we already cleared above)
-                        filename = os.path.basename(vf)
-                        local_path = os.path.join(target_video_dir, filename)
-                        shutil.copy2(vf, local_path)
-                        local_video_paths.append(local_path)
-                
+                local_video_paths = _as_existing_source_paths(video_files)
                 if local_video_paths:
                     session_state['local_video_paths'] = local_video_paths
                     session_state['original_video_paths'] = video_files
                 else:
-                    return None, '❌ Error: Could not save video files', session_state
+                    return None, '❌ Error: Could not access video files', session_state
             else:
                 local_video_paths = session_state.get('local_video_paths')
         else:
-            return None, '❌ Error: No valid video files uploaded', session_state
+            return None, '❌ Error: No video files selected', session_state
 
         # Verify files exist
         if not local_audio_path or not os.path.exists(local_audio_path):
-             return None, f"❌ Error: Audio file is missing from input directory.", session_state
+             return None, f"❌ Error: Audio file is missing or inaccessible.", session_state
         if not local_video_paths or not all(p and os.path.exists(p) for p in local_video_paths):
-             return None, f"❌ Error: Video files are missing from input directory.", session_state
+             return None, f"❌ Error: Video files are missing or inaccessible.", session_state
         
         # Set GPU mode
         use_gpu = GPU_AVAILABLE
@@ -554,7 +429,6 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         output_path = os.path.join(output_folder, filename)
         temp_output = os.path.join(session_dir, filename)
 
-        processing_started = True
         selected_beats, beat_info = analyze_beats_auto(
             local_audio_path,
             use_gpu=use_gpu,
@@ -564,10 +438,6 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         )
         beat_times = beat_info.get('times', selected_beats)
         _stage5_summary(console_logger, beat_info.get("video_analysis"))
-
-        # Qwen/vLLM is only needed for Stage 5. Stop the bundled local server
-        # before Stage 6 so render/NVENC can use the released GPU VRAM.
-        vllm_stopped_after_stage5 = stop_local_vllm_server(wait=True)
 
         if progress_callback:
             progress_callback(_stage_status(6))
@@ -636,9 +506,6 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         import traceback
         traceback.print_exc()
         return None, error_msg, session_state
-    finally:
-        if processing_started and not vllm_stopped_after_stage5:
-            stop_local_vllm_server(wait=True)
 
 
 def process_video(audio_file: str, video_files: VideoFilesInput,
@@ -698,14 +565,11 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
 
 def cleanup_on_startup():
     """
-    Clean temporary runtime files on script start, but keep the user's latest
-    input/audio and input/video files.
-
-    Audio/video folders are only cleared when a new upload is saved for that
-    same category. This preserves the latest selected files across app restarts.
+    Clean temporary runtime files on script start while preserving user inputs
+    and the persistent video analysis cache.
     """
     input_base = get_input_dir()
-    protected_dirs = {'audio', 'video'}
+    protected_dirs = {'audio', 'video', 'video_analysis_cache'}
 
     try:
         os.makedirs(get_audio_input_dir(), exist_ok=True)
@@ -738,7 +602,7 @@ def cleanup_on_startup():
 def create_ui() -> gr.Blocks:
     # These definitions are needed within the function's scope
     python_status = "✅ Portable (bin/python-3.13.13-embed-amd64/)" if USING_PORTABLE_PYTHON else "⚠️  System Python"
-    cuda_status = "✅ Portable (bin/CUDA/v13.2)" if USING_PORTABLE_CUDA else "⚠️  System CUDA (or not available)"
+    cuda_status = "✅ Portable (bin/CUDA/v13.0)" if USING_PORTABLE_CUDA else "⚠️  System CUDA (or not available)"
     ffmpeg_status = "✅ Portable (bin/ffmpeg/)" if FFMPEG_FOUND else "⚠️  System FFmpeg"
     
     app = gr.Blocks(title='BeatSync Engine', theme='ocean', css=STATUS_BOX_CSS)
