@@ -16,5 +16,6 @@ if not "%INSTALL_EXIT%"=="0" (
 )
 
 echo.
-echo Install completed. Use run.bat to start BeatSync Engine.
+echo Install completed: llama.cpp Vulkan + CuPy CTK runtime is ready.
+echo Use run.bat to start BeatSync Engine.
 pause

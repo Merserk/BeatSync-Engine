@@ -4,6 +4,7 @@ import sys
 import subprocess
 import librosa
 from typing import Dict
+from importlib import metadata
 
 # ============================================================================
 # PATHS & DIRECTORIES
@@ -16,12 +17,42 @@ ROOT_DIR = os.path.dirname(SRC_DIR)
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-PORTABLE_CUDA_DIR = os.path.join(ROOT_DIR, 'bin', 'CUDA', 'v13.0')
-PORTABLE_PYTHON_DIR = os.path.join(ROOT_DIR, 'bin', 'python-3.13.13-embed-amd64')
+PORTABLE_CUDA_DIR = os.path.join(ROOT_DIR, 'bin', 'CUDA', 'v13.3')
+PORTABLE_PYTHON_DIR = os.path.join(ROOT_DIR, 'bin', 'python-3.13.14-embed-amd64')
 FFMPEG_BIN_DIR = os.path.join(ROOT_DIR, 'bin', 'ffmpeg')
 FFMPEG_EXE = os.path.join(FFMPEG_BIN_DIR, 'ffmpeg.exe')
 
-USING_PORTABLE_CUDA = os.path.exists(PORTABLE_CUDA_DIR)
+def _package_installed(name: str) -> bool:
+    try:
+        metadata.version(name)
+        return True
+    except metadata.PackageNotFoundError:
+        return False
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, '').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _is_same_or_child_path(path: str, parent: str) -> bool:
+    try:
+        norm_path = os.path.normcase(os.path.abspath(path))
+        norm_parent = os.path.normcase(os.path.abspath(parent))
+        return norm_path == norm_parent or norm_path.startswith(norm_parent + os.sep)
+    except Exception:
+        return False
+
+
+def _strip_path_prefix(path_value: str, prefix: str) -> str:
+    parts = []
+    for entry in path_value.split(os.pathsep):
+        if entry and not _is_same_or_child_path(entry, prefix):
+            parts.append(entry)
+    return os.pathsep.join(parts)
+
+
+USING_CUPY_CTK = _package_installed('cuda-toolkit') and not _env_truthy('BEATSYNC_FORCE_PORTABLE_CUDA')
+USING_PORTABLE_CUDA = os.path.exists(PORTABLE_CUDA_DIR) and not USING_CUPY_CTK
 USING_PORTABLE_PYTHON = os.path.exists(PORTABLE_PYTHON_DIR)
 FFMPEG_FOUND = os.path.exists(FFMPEG_EXE)
 
@@ -32,7 +63,13 @@ FFMPEG_FOUND = os.path.exists(FFMPEG_EXE)
 def setup_environment():
     """Configure portable environment variables for CUDA and Python."""
     # CUDA Setup
-    if USING_PORTABLE_CUDA:
+    if USING_CUPY_CTK:
+        for key in ('CUDA_PATH', 'CUDA_HOME', 'CUDA_ROOT'):
+            os.environ.pop(key, None)
+        os.environ['PATH'] = _strip_path_prefix(os.environ.get('PATH', ''), PORTABLE_CUDA_DIR)
+        if 'LD_LIBRARY_PATH' in os.environ:
+            os.environ['LD_LIBRARY_PATH'] = _strip_path_prefix(os.environ.get('LD_LIBRARY_PATH', ''), PORTABLE_CUDA_DIR)
+    elif USING_PORTABLE_CUDA:
         os.environ['CUDA_PATH'] = PORTABLE_CUDA_DIR
         os.environ['CUDA_HOME'] = PORTABLE_CUDA_DIR
         os.environ['CUDA_ROOT'] = PORTABLE_CUDA_DIR
@@ -73,7 +110,8 @@ def get_gpu_info() -> Dict:
         'available': False,
         'name': 'No GPU',
         'cuda_version': 'None',
-        'is_portable': USING_PORTABLE_CUDA
+        'is_portable': USING_PORTABLE_CUDA,
+        'backend': 'CuPy CTK' if USING_CUPY_CTK else ('Portable CUDA' if USING_PORTABLE_CUDA else 'System CUDA')
     }
     
     try:
@@ -123,7 +161,7 @@ def print_startup_banner():
     python_type = "Portable" if USING_PORTABLE_PYTHON else "System"
     print(f"   Python: {python_type} ({sys.version.split()[0]})")
     
-    cuda_type = "Portable (v13.0)" if gpu['is_portable'] else "System"
+    cuda_type = gpu.get('backend', "Portable CUDA" if gpu['is_portable'] else "System CUDA")
     if gpu['available']:
         print(f"   CUDA: {cuda_type} | Runtime: {gpu['cuda_version']}")
         print(f"   GPU: {gpu['name']}")

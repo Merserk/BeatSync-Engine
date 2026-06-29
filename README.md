@@ -3,7 +3,7 @@
 [![Downloads](https://img.shields.io/github/downloads/Merserk/BeatSync-Engine/total.svg?style=flat-square&label=Downloads)](https://github.com/Merserk/BeatSync-Engine/releases)
 [![Windows](https://img.shields.io/badge/Platform-Windows-0078D4?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Python](https://img.shields.io/badge/Python-Portable%203.13-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![CUDA](https://img.shields.io/badge/NVIDIA-CUDA%2013.0-76B900?style=flat-square&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
+[![CuPy CTK](https://img.shields.io/badge/CUDA-CuPy%20CTK-76B900?style=flat-square&logo=nvidia&logoColor=white)](https://cupy.dev/)
 [![NVENC](https://img.shields.io/badge/Encoding-NVENC-76B900?style=flat-square&logo=nvidia&logoColor=white)](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new)
 [![FFmpeg](https://img.shields.io/badge/FFmpeg-Portable-007808?style=flat-square&logo=ffmpeg&logoColor=white)](https://ffmpeg.org/)
 [![Gradio](https://img.shields.io/badge/UI-Gradio-F97316?style=flat-square)](https://www.gradio.app/)
@@ -34,12 +34,12 @@ BeatSync Engine analyzes music rhythm, energy, sections, and source-video moment
 *   **🎼 Song Structure Detection:** Finds broad intro, verse, chorus, bridge, drop, build, body, and outro-style sections.
 *   **🥁 Rhythm Feature Analysis:** Reads kick, clap, bass, hi-hat, novelty, impact, bar anchors, and phrase anchors.
 *   **🎬 Source Video Moment Library:** Scans source videos for motion, quality, scene changes, action, beauty, and usable moments.
-*   **🧠 Qwen3-VL Semantic Tags:** Optional local vision-language tagging for action, combat, chase, beauty, emotion, drops, builds, and soft moments.
+*   **🧠 Qwen3-VL Semantic Tags:** Optional local llama.cpp Vulkan vision-language tagging for action, combat, chase, beauty, emotion, drops, builds, and soft moments.
 *   **🎯 Audio-Visual Planner:** Chooses planned source moments instead of relying only on random clip sampling.
-*   **⚡ NVIDIA GPU Acceleration:** Uses CuPy/CUDA for analysis when available and FFmpeg NVENC for fast H.264/H.265 encoding.
+*   **⚡ GPU Acceleration:** Uses CuPy CTK wheel libraries for CUDA analysis when available, llama.cpp Vulkan for Qwen3-VL, and FFmpeg NVENC for fast H.264/H.265 encoding.
 *   **🎞️ Frame-Locked Timeline:** Quantizes cut boundaries to absolute output frames to avoid timing drift.
 *   **🎬 Multiple Export Modes:** NVENC H.264, NVENC HEVC, CPU H.264, and ProRes 422 Proxy precise mode.
-*   **📦 Portable Runtime:** Designed around bundled Python, CUDA, FFmpeg, Transformers, and local model folders.
+*   **📦 Portable Runtime:** Designed around bundled Python, FFmpeg, llama.cpp Vulkan, CuPy CTK, and local GGUF model files.
 *   **🌐 Local Web UI:** Launches a Gradio interface at `http://127.0.0.1:7860` by default.
 *   **🧹 Local Caches:** Reuses visual analysis data so repeated runs can be faster.
 
@@ -57,12 +57,13 @@ BeatSync Engine/
 ├── scripts/
 │   └── install.ps1                          # Portable runtime/model installer
 ├── bin/
-│   ├── python-3.13.13-embed-amd64/          # Main portable Python runtime
-│   ├── CUDA/v13.0/                          # Portable CUDA runtime files
+│   ├── python-3.13.14-embed-amd64/          # Main portable Python runtime
 │   ├── ffmpeg/ffmpeg.exe                    # Portable FFmpeg
 │   ├── ffmpeg/ffprobe.exe                   # Portable FFprobe
+│   ├── llama-bin-win-vulkan-x64/            # llama.cpp Vulkan backend
 │   └── models/
-│       └── Qwen3-VL-2B-Instruct/            # Local vision-language model
+│       ├── Qwen3VL-2B-Instruct-Q8_0.gguf    # Local Qwen3-VL GGUF model
+│       └── mmproj-Qwen3VL-2B-Instruct-F16.gguf
 ├── src/
 │   ├── gui.py                               # Gradio web UI
 │   ├── video_processor.py                   # Rendering pipeline
@@ -74,7 +75,7 @@ BeatSync Engine/
 │   │   ├── stage2_features.py               # Energy/rhythm features
 │   │   ├── stage3_sections.py               # Music section analysis
 │   │   ├── stage4_select.py                 # Rhythmic cut selection
-│   │   ├── stage5_qwen_scene_worker.py      # Qwen/Transformers semantic worker
+│   │   ├── stage5_qwen_scene_worker.py      # Qwen/llama.cpp Vulkan semantic worker
 │   │   └── stage6_av_planner.py             # Audio-visual clip planner
 │   └── ui_content.py                        # UI labels and status text
 ├── input/
@@ -238,7 +239,7 @@ Deterministic analysis reads:
 *   beauty score;
 *   reusable candidate moments.
 
-Optional local Qwen3-VL analysis through Transformers adds semantic tags like:
+Optional local Qwen3-VL analysis through llama.cpp Vulkan adds semantic tags like:
 
 ```text
 action
@@ -255,6 +256,22 @@ visual_quality
 ### Stage 6 - Audio-visual render
 
 The renderer creates a frame-accurate cut timeline, chooses source moments for each segment, extracts clips with FFmpeg, concatenates the result, and adds the music track.
+
+---
+
+## Runtime Notes
+
+BeatSync does not require PyTorch, Transformers, or a separately installed CUDA Toolkit. The installer uses `cupy-cuda13x[ctk]`, which downloads the CUDA runtime libraries CuPy needs into the portable Python environment.
+
+Qwen3-VL semantic tagging uses the bundled llama.cpp Vulkan backend and these GGUF files:
+
+```text
+bin/llama-bin-win-vulkan-x64/
+bin/models/Qwen3VL-2B-Instruct-Q8_0.gguf
+bin/models/mmproj-Qwen3VL-2B-Instruct-F16.gguf
+```
+
+For Qwen3-VL acceleration, install current GPU drivers with Vulkan support. NVIDIA NVENC export still requires an NVIDIA GPU with NVENC support.
 
 ---
 

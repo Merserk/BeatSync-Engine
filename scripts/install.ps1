@@ -6,18 +6,21 @@ $Root = Split-Path -Parent $ScriptDir
 $BinDir = Join-Path $Root "bin"
 $DownloadsDir = Join-Path $BinDir "downloads"
 $UvDir = Join-Path $BinDir "uv"
-$PythonDir = Join-Path $BinDir "python-3.13.13-embed-amd64"
+$PythonVersion = "3.13.14"
+$FfmpegVersion = "8.1.2"
+$LlamaBuild = "b9842"
+$LlamaDir = Join-Path $BinDir "llama-bin-win-vulkan-x64"
+$PythonDir = Join-Path $BinDir "python-$PythonVersion-embed-amd64"
 $PythonExe = Join-Path $PythonDir "python.exe"
-$CudaDir = Join-Path $BinDir "CUDA\v13.0"
 $FfmpegDir = Join-Path $BinDir "ffmpeg"
-$ModelDir = Join-Path $BinDir "models\Qwen3-VL-2B-Instruct"
+$ModelsDir = Join-Path $BinDir "models"
 
-$PythonZipUrl = "https://www.python.org/ftp/python/3.13.13/python-3.13.13-embed-amd64.zip"
+$PythonZipUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-embed-amd64.zip"
 $UvZipUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
-$FfmpegZipUrl = "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-essentials_build.zip"
-$CudaManifestUrl = "https://developer.download.nvidia.com/compute/cuda/redist/redistrib_13.0.2.json"
-$CudaBaseUrl = "https://developer.download.nvidia.com/compute/cuda/redist/"
-$TorchIndexUrl = "https://download.pytorch.org/whl/cu130"
+$FfmpegZipUrl = "https://github.com/GyanD/codexffmpeg/releases/download/$FfmpegVersion/ffmpeg-$FfmpegVersion-essentials_build.zip"
+$LlamaZipUrl = "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaBuild/llama-$LlamaBuild-bin-win-vulkan-x64.zip"
+$QwenModelUrl = "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3VL-2B-Instruct-Q8_0.gguf?download=true"
+$QwenMmprojUrl = "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-2B-Instruct-F16.gguf?download=true"
 
 function Step($Message) {
     Write-Host ""
@@ -26,6 +29,18 @@ function Step($Message) {
 
 function Ensure-Dir($Path) {
     New-Item -ItemType Directory -Force -Path $Path | Out-Null
+}
+
+function Assert-InDirectory($Path, $Parent, $Label) {
+    $ResolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $ResolvedParent = (Resolve-Path -LiteralPath $Parent).Path
+    $IsInside = (
+        $ResolvedPath.Equals($ResolvedParent, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $ResolvedPath.StartsWith($ResolvedParent + [IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+    )
+    if (-not $IsInside) {
+        throw "Refusing to operate on $Label outside expected folder: $ResolvedPath"
+    }
 }
 
 function Get-CurlExe {
@@ -86,12 +101,12 @@ function Invoke-CurlDownload($CurlExe, $Url, $OutFile, [bool]$Resume) {
     return $LASTEXITCODE
 }
 
-function Download-File($Url, $Path) {
+function Download-File($Url, $Path, [long]$MinimumBytes = 1) {
     Ensure-Dir (Split-Path -Parent $Path)
 
     if (Test-Path $Path) {
         $Existing = Get-Item -LiteralPath $Path
-        if ($Existing.Length -gt 0) {
+        if ($Existing.Length -ge $MinimumBytes) {
             Write-Host "Using cached file: $Path"
             return
         }
@@ -127,9 +142,9 @@ function Download-File($Url, $Path) {
     if (-not (Test-Path $TempPath)) {
         throw "curl reported success, but output file was not created: $TempPath"
     }
-    if ((Get-Item -LiteralPath $TempPath).Length -le 0) {
+    if ((Get-Item -LiteralPath $TempPath).Length -lt $MinimumBytes) {
         Remove-Item -LiteralPath $TempPath -Force -ErrorAction SilentlyContinue
-        throw "downloaded file is empty: $Url"
+        throw "downloaded file is too small: $Url"
     }
 
     Move-Item -LiteralPath $TempPath -Destination $Path -Force
@@ -138,6 +153,15 @@ function Download-File($Url, $Path) {
 function Expand-Zip($ZipPath, $Destination) {
     Ensure-Dir $Destination
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $Destination -Force
+}
+
+function Remove-SafeFolder($Path, $Parent, $Label) {
+    if (-not (Test-Path $Path)) {
+        return
+    }
+    Assert-InDirectory $Path $Parent $Label
+    Write-Host "Removing legacy $Label`: $Path"
+    Remove-Item -LiteralPath $Path -Recurse -Force
 }
 
 function Install-Uv {
@@ -150,7 +174,7 @@ function Install-Uv {
 
     Ensure-Dir $UvDir
     $Archive = Join-Path $DownloadsDir "uv-x86_64-pc-windows-msvc.zip"
-    Download-File $UvZipUrl $Archive
+    Download-File $UvZipUrl $Archive 1048576
     Expand-Zip $Archive $UvDir
 
     $Found = Get-ChildItem -Path $UvDir -Recurse -Filter "uv.exe" | Select-Object -First 1
@@ -164,10 +188,10 @@ function Install-Uv {
 }
 
 function Install-Python {
-    Step "Installing portable Python 3.13.13"
+    Step "Installing portable Python $PythonVersion"
     if (-not (Test-Path $PythonExe)) {
-        $Archive = Join-Path $DownloadsDir "python-3.13.13-embed-amd64.zip"
-        Download-File $PythonZipUrl $Archive
+        $Archive = Join-Path $DownloadsDir "python-$PythonVersion-embed-amd64.zip"
+        Download-File $PythonZipUrl $Archive 1048576
         if (Test-Path $PythonDir) {
             Remove-Item -LiteralPath $PythonDir -Recurse -Force
         }
@@ -188,17 +212,25 @@ function Install-Python {
 }
 
 function Install-FFmpeg {
-    Step "Installing FFmpeg release zip"
+    Step "Installing FFmpeg $FfmpegVersion release zip"
     $FfmpegExe = Join-Path $FfmpegDir "ffmpeg.exe"
     $FfprobeExe = Join-Path $FfmpegDir "ffprobe.exe"
     if ((Test-Path $FfmpegExe) -and (Test-Path $FfprobeExe)) {
-        Write-Host "FFmpeg ready: $FfmpegDir"
-        return
+        try {
+            $CurrentVersion = (& $FfmpegExe -version 2>$null | Select-Object -First 1)
+            if ($CurrentVersion -match [regex]::Escape($FfmpegVersion)) {
+                Write-Host "FFmpeg ready: $FfmpegDir"
+                return
+            }
+            Write-Host "Existing FFmpeg is not $FfmpegVersion; replacing portable binaries."
+        } catch {
+            Write-Host "Existing FFmpeg version check failed; replacing portable binaries."
+        }
     }
 
     Ensure-Dir $FfmpegDir
-    $Archive = Join-Path $DownloadsDir "ffmpeg-8.1.1-essentials_build.zip"
-    Download-File $FfmpegZipUrl $Archive
+    $Archive = Join-Path $DownloadsDir "ffmpeg-$FfmpegVersion-essentials_build.zip"
+    Download-File $FfmpegZipUrl $Archive 1048576
     $ExtractDir = Join-Path $DownloadsDir "ffmpeg-extract"
     if (Test-Path $ExtractDir) {
         Remove-Item -LiteralPath $ExtractDir -Recurse -Force
@@ -214,97 +246,52 @@ function Install-FFmpeg {
     Copy-Item -LiteralPath (Join-Path $ExtractedBin "ffprobe.exe") -Destination $FfmpegDir -Force
 }
 
-function Copy-CudaArchiveContent($ExtractDir) {
-    foreach ($Name in @("bin", "include", "lib")) {
-        $Folders = Get-ChildItem -Path $ExtractDir -Directory -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -eq $Name }
-        foreach ($Folder in $Folders) {
-            $Target = Join-Path $CudaDir $Name
-            Ensure-Dir $Target
-            Copy-Item -Path (Join-Path $Folder.FullName "*") -Destination $Target -Recurse -Force -ErrorAction SilentlyContinue
+function Install-LlamaCppVulkan {
+    Step "Installing llama.cpp Vulkan $LlamaBuild"
+    $ServerExe = Join-Path $LlamaDir "llama-server.exe"
+    $MtmdExe = Join-Path $LlamaDir "llama-mtmd-cli.exe"
+    $CliExe = Join-Path $LlamaDir "llama-cli.exe"
+    if ((Test-Path $ServerExe) -and (Test-Path $MtmdExe) -and (Test-Path $CliExe)) {
+        try {
+            $CurrentVersion = (& $CliExe --version 2>$null | Select-Object -First 1)
+            if ($CurrentVersion -match "version:\s+9842\b") {
+                Write-Host "llama.cpp Vulkan ready: $LlamaDir"
+                return
+            }
+            Write-Host "Existing llama.cpp build is not $LlamaBuild; replacing Vulkan binaries."
+        } catch {
+            Write-Host "Existing llama.cpp version check failed; replacing Vulkan binaries."
         }
     }
-    $Licenses = Get-ChildItem -Path $ExtractDir -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match "^(LICENSE|EULA|version\.json)" }
-    foreach ($File in $Licenses) {
-        Copy-Item -LiteralPath $File.FullName -Destination $CudaDir -Force -ErrorAction SilentlyContinue
-    }
-}
 
-function Install-CudaRedistributables {
-    Step "Installing portable CUDA 13.0 redistributable components"
-    $Cudart = Get-ChildItem -Path $CudaDir -Recurse -Filter "cudart64_13.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-    $Nvrtc = Get-ChildItem -Path $CudaDir -Recurse -Filter "nvrtc64_*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($Cudart -and $Nvrtc) {
-        Write-Host "CUDA redistributables already present: $CudaDir"
-        return
+    $Archive = Join-Path $DownloadsDir "llama-$LlamaBuild-bin-win-vulkan-x64.zip"
+    Download-File $LlamaZipUrl $Archive 1048576
+    $ExtractDir = Join-Path $DownloadsDir "llama-vulkan-extract"
+    if (Test-Path $ExtractDir) {
+        Remove-Item -LiteralPath $ExtractDir -Recurse -Force
+    }
+    Expand-Zip $Archive $ExtractDir
+
+    $ExtractedServer = Get-ChildItem -Path $ExtractDir -Recurse -Filter "llama-server.exe" | Select-Object -First 1
+    if (-not $ExtractedServer) {
+        throw "llama.cpp archive extracted, but llama-server.exe was not found."
     }
 
-    Ensure-Dir $CudaDir
-    $ManifestPath = Join-Path $DownloadsDir "redistrib_13.0.2.json"
-    Download-File $CudaManifestUrl $ManifestPath
-    $Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
-    $Components = @(
-        "cuda_cudart",
-        "cuda_nvrtc",
-        "cuda_nvtx",
-        "cuda_opencl",
-        "cuda_nvml_dev",
-        "libcublas",
-        "libcufft",
-        "libcurand",
-        "libcusolver",
-        "libcusparse",
-        "libnpp",
-        "libnvfatbin",
-        "libnvjitlink",
-        "libnvjpeg",
-        "libnvptxcompiler"
-    )
-
-    foreach ($Component in $Components) {
-        $Info = $Manifest.$Component
-        if (-not $Info) {
-            Write-Host "Skipping missing CUDA manifest component: $Component"
-            continue
-        }
-        $Package = $Info."windows-x86_64"
-        if (-not $Package) {
-            Write-Host "Skipping CUDA component without Windows package: $Component"
-            continue
-        }
-
-        $Url = $CudaBaseUrl + $Package.relative_path
-        $Archive = Join-Path $DownloadsDir (Split-Path -Leaf $Package.relative_path)
-        Download-File $Url $Archive
-
-        $ExtractDir = Join-Path $DownloadsDir ("cuda-" + $Component)
-        if (Test-Path $ExtractDir) {
-            Remove-Item -LiteralPath $ExtractDir -Recurse -Force
-        }
-        Expand-Zip $Archive $ExtractDir
-        Copy-CudaArchiveContent $ExtractDir
+    if (Test-Path $LlamaDir) {
+        Remove-Item -LiteralPath $LlamaDir -Recurse -Force
     }
-
-    $VersionPath = Join-Path $CudaDir "version.json"
-    @{
-        cuda = @{
-            name = "CUDA redistributables"
-            version = $Manifest.release_label
-        }
-    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $VersionPath -Encoding UTF8
+    Ensure-Dir $LlamaDir
+    $ExtractedBin = Split-Path -Parent $ExtractedServer.FullName
+    Copy-Item -Path (Join-Path $ExtractedBin "*") -Destination $LlamaDir -Recurse -Force
 }
 
 function Install-PythonPackages($UvExe) {
     Step "Installing Python packages with UV"
     $Env:UV_LINK_MODE = "copy"
-    $Env:CUDA_PATH = $CudaDir
-    $Env:CUDA_HOME = $CudaDir
-    $Env:CUDA_ROOT = $CudaDir
+    foreach ($Name in @("CUDA_PATH", "CUDA_HOME", "CUDA_ROOT")) {
+        Remove-Item "Env:$Name" -ErrorAction SilentlyContinue
+    }
     $Env:PATH = @(
-        (Join-Path $CudaDir "bin\x64"),
-        (Join-Path $CudaDir "bin"),
-        (Join-Path $CudaDir "lib\x64"),
         $FfmpegDir,
         $PythonDir,
         (Join-Path $PythonDir "Scripts"),
@@ -314,50 +301,24 @@ function Install-PythonPackages($UvExe) {
     & $UvExe pip install --python $PythonExe --system --upgrade pip setuptools wheel
     if ($LASTEXITCODE -ne 0) { throw "UV failed while installing pip/setuptools/wheel." }
 
-    & $UvExe pip install --python $PythonExe --system `
-        "torch==2.11.0+cu130" `
-        "torchvision==0.26.0+cu130" `
-        "torchaudio==2.11.0+cu130" `
-        --index-url $TorchIndexUrl
-    if ($LASTEXITCODE -ne 0) { throw "UV failed while installing PyTorch CUDA packages." }
-
-    & $UvExe pip install --python $PythonExe --system --index-url "https://pypi.org/simple" "setuptools>=82.0.1" wheel
-    if ($LASTEXITCODE -ne 0) { throw "UV failed while restoring packaging tools after PyTorch install." }
-
-    & $UvExe pip install --python $PythonExe --system -r (Join-Path $Root "requirements.txt")
+    & $UvExe pip install --python $PythonExe --system --upgrade -r (Join-Path $Root "requirements.txt")
     if ($LASTEXITCODE -ne 0) { throw "UV failed while installing app requirements." }
 }
 
-function Install-QwenModel {
-    Step "Installing Qwen3-VL-2B-Instruct model"
-    $ModelWeights = Join-Path $ModelDir "model.safetensors"
-    if ((Test-Path $ModelDir) -and
-        (Test-Path (Join-Path $ModelDir "config.json")) -and
-        (Test-Path $ModelWeights) -and
-        ((Get-Item -LiteralPath $ModelWeights).Length -gt 1048576)) {
-        Write-Host "Model already present: $ModelDir"
-        return
-    }
-
-    Ensure-Dir (Split-Path -Parent $ModelDir)
-    if (Test-Path $ModelDir) {
-        Remove-Item -LiteralPath $ModelDir -Recurse -Force
-    }
-
-    $DownloadScript = Join-Path $DownloadsDir "download_qwen_model.py"
-    $Code = @"
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id='Qwen/Qwen3-VL-2B-Instruct',
-    local_dir=r'''$ModelDir''',
-    max_workers=8,
-)
-"@
-    Set-Content -LiteralPath $DownloadScript -Value $Code -Encoding UTF8
-    & $PythonExe -X utf8 $DownloadScript
+function Remove-LegacyPythonPackages($UvExe) {
+    Step "Removing legacy PyTorch/Transformers packages"
+    $Packages = @("torch", "torchvision", "torchaudio", "accelerate", "transformers", "safetensors")
+    & $UvExe pip uninstall --python $PythonExe --system -y @Packages
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to download Qwen/Qwen3-VL-2B-Instruct."
+        throw "UV failed while removing legacy PyTorch/Transformers packages."
     }
+}
+
+function Install-QwenGgufModels {
+    Step "Installing Qwen3-VL GGUF models"
+    Ensure-Dir $ModelsDir
+    Download-File $QwenModelUrl (Join-Path $ModelsDir "Qwen3VL-2B-Instruct-Q8_0.gguf") 104857600
+    Download-File $QwenMmprojUrl (Join-Path $ModelsDir "mmproj-Qwen3VL-2B-Instruct-F16.gguf") 104857600
 }
 
 function Ensure-AppFolders {
@@ -375,15 +336,20 @@ function Ensure-AppFolders {
     }
 }
 
-function Remove-LegacyGitFiles {
-    $LegacyGitDir = Join-Path $BinDir "PortableGit"
+function Remove-LegacyFiles {
+    Step "Removing legacy runtime files"
+    Remove-SafeFolder (Join-Path $BinDir "PortableGit") $BinDir "PortableGit folder"
+    Remove-SafeFolder (Join-Path $BinDir "CUDA\v13.3") $BinDir "portable CUDA Toolkit"
+    Remove-SafeFolder (Join-Path $BinDir "models\Qwen3-VL-2B-Instruct") $BinDir "Transformers Qwen model"
+
     $LegacyMinGitZip = Join-Path $DownloadsDir "MinGit-2.54.0-64-bit.zip"
-    if (Test-Path $LegacyGitDir) {
-        Step "Removing legacy portable Git folder"
-        Remove-Item -LiteralPath $LegacyGitDir -Recurse -Force
-    }
     if (Test-Path $LegacyMinGitZip) {
         Remove-Item -LiteralPath $LegacyMinGitZip -Force
+    }
+
+    $CudaRoot = Join-Path $BinDir "CUDA"
+    if ((Test-Path $CudaRoot) -and (-not (Get-ChildItem -LiteralPath $CudaRoot -Force -ErrorAction SilentlyContinue))) {
+        Remove-Item -LiteralPath $CudaRoot -Force
     }
 }
 
@@ -391,13 +357,9 @@ function Remove-InstallerFolder($Path, $Label) {
     if (-not (Test-Path $Path)) {
         return
     }
-    $ResolvedPath = (Resolve-Path -LiteralPath $Path).Path
-    $ResolvedBin = (Resolve-Path -LiteralPath $BinDir).Path
-    if (-not $ResolvedPath.StartsWith($ResolvedBin, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to clean $Label outside bin folder: $ResolvedPath"
-    }
-    Write-Host "Cleaning $Label`: $ResolvedPath"
-    Remove-Item -LiteralPath $ResolvedPath -Recurse -Force
+    Assert-InDirectory $Path $BinDir $Label
+    Write-Host "Cleaning $Label`: $Path"
+    Remove-Item -LiteralPath $Path -Recurse -Force
 }
 
 function Cleanup-InstallerFiles {
@@ -406,30 +368,53 @@ function Cleanup-InstallerFiles {
     Remove-InstallerFolder $UvDir "UV"
 }
 
+function Test-RequiredFile($Path, $Label) {
+    if (-not (Test-Path $Path)) {
+        throw "Missing $Label`: $Path"
+    }
+}
+
 Ensure-Dir $BinDir
 Ensure-Dir $DownloadsDir
 Ensure-AppFolders
-Remove-LegacyGitFiles
+Remove-LegacyFiles
 
 Install-Python
 $UvExe = Install-Uv
 Install-FFmpeg
-Install-CudaRedistributables
+Install-LlamaCppVulkan
 Install-PythonPackages $UvExe
-Install-QwenModel
+Remove-LegacyPythonPackages $UvExe
+Install-QwenGgufModels
 
 Step "Verifying portable install"
-& $PythonExe -X utf8 -c "import sys, gradio, librosa, cv2, numpy, cupy; print('Python', sys.version.split()[0]); print('gradio', gradio.__version__); print('librosa', librosa.__version__)"
+& $PythonExe -X utf8 -c "import sys, gradio, librosa, cv2, numpy, cupy, numba; print('Python', sys.version.split()[0]); print('gradio', gradio.__version__); print('librosa', librosa.__version__); print('cupy', cupy.__version__); print('numba', numba.__version__); x = cupy.arange(10, dtype=cupy.int32); print('CUDA runtime', cupy.cuda.runtime.runtimeGetVersion()); print('GPU sum', int(cupy.sum(x).get()))"
 if ($LASTEXITCODE -ne 0) {
-    throw "Portable app import verification failed."
+    throw "Portable app import/CuPy CTK verification failed."
 }
 
-& $PythonExe -X utf8 -c "import torch, transformers; print('torch', torch.__version__); print('transformers', transformers.__version__)"
+& $PythonExe -X utf8 -c "import importlib.util, sys; missing = [name for name in ('torch', 'torchvision', 'torchaudio', 'accelerate', 'transformers', 'safetensors') if importlib.util.find_spec(name) is not None]; print('legacy packages', missing); sys.exit(1 if missing else 0)"
 if ($LASTEXITCODE -ne 0) {
-    throw "Portable Torch/Transformers import verification failed."
+    throw "Legacy PyTorch/Transformers packages are still installed."
+}
+
+Test-RequiredFile (Join-Path $LlamaDir "llama-server.exe") "llama-server.exe"
+Test-RequiredFile (Join-Path $LlamaDir "llama-mtmd-cli.exe") "llama-mtmd-cli.exe"
+Test-RequiredFile (Join-Path $LlamaDir "llama-cli.exe") "llama-cli.exe"
+Test-RequiredFile (Join-Path $ModelsDir "Qwen3VL-2B-Instruct-Q8_0.gguf") "Qwen GGUF model"
+Test-RequiredFile (Join-Path $ModelsDir "mmproj-Qwen3VL-2B-Instruct-F16.gguf") "Qwen mmproj model"
+
+& (Join-Path $LlamaDir "llama-cli.exe") --version
+if ($LASTEXITCODE -ne 0) {
+    throw "llama-cli.exe --version failed."
+}
+
+& $PythonExe -X utf8 -m pip check
+if ($LASTEXITCODE -ne 0) {
+    throw "pip check failed."
 }
 
 Cleanup-InstallerFiles
 
 Write-Host ""
-Write-Host "Portable install is ready." -ForegroundColor Green
+Write-Host "Portable install is ready: llama.cpp Vulkan + CuPy CTK, no PyTorch." -ForegroundColor Green

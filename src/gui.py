@@ -63,7 +63,7 @@ _install_windows_asyncio_connection_reset_filter()
 
 from logger import (
     setup_environment,
-    USING_PORTABLE_PYTHON, USING_PORTABLE_CUDA, FFMPEG_FOUND
+    USING_PORTABLE_PYTHON, USING_PORTABLE_CUDA, USING_CUPY_CTK, FFMPEG_FOUND
 )
 
 # Initialize environment
@@ -411,7 +411,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         gpu_encoder = processing_mode if use_nvenc else 'none'
         
         python_str = "Portable" if USING_PORTABLE_PYTHON else "System"
-        cuda_str = "Portable" if USING_PORTABLE_CUDA else "System/None"
+        cuda_str = "CuPy CTK" if USING_CUPY_CTK else ("Portable" if USING_PORTABLE_CUDA else "System/None")
 
         # Determine FPS
         if custom_fps is not None and custom_fps > 0:
@@ -601,8 +601,13 @@ def cleanup_on_startup():
 
 def create_ui() -> gr.Blocks:
     # These definitions are needed within the function's scope
-    python_status = "✅ Portable (bin/python-3.13.13-embed-amd64/)" if USING_PORTABLE_PYTHON else "⚠️  System Python"
-    cuda_status = "✅ Portable (bin/CUDA/v13.0)" if USING_PORTABLE_CUDA else "⚠️  System CUDA (or not available)"
+    python_status = "✅ Portable (bin/python-3.13.14-embed-amd64/)" if USING_PORTABLE_PYTHON else "⚠️  System Python"
+    if USING_CUPY_CTK:
+        cuda_status = "✅ CuPy CTK (Python wheel libraries)"
+    elif USING_PORTABLE_CUDA:
+        cuda_status = "✅ Portable (bin/CUDA/v13.3)"
+    else:
+        cuda_status = "⚠️  System CUDA (or not available)"
     ffmpeg_status = "✅ Portable (bin/ffmpeg/)" if FFMPEG_FOUND else "⚠️  System FFmpeg"
     
     app = gr.Blocks(title='BeatSync Engine', theme='ocean', css=STATUS_BOX_CSS)

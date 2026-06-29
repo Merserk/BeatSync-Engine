@@ -6,7 +6,7 @@ import os
 
 import numpy as np
 
-from logger import get_gpu_info, check_nvenc, setup_environment, USING_PORTABLE_CUDA
+from logger import get_gpu_info, check_nvenc, setup_environment
 
 
 CPU_COUNT = multiprocessing.cpu_count()
@@ -62,7 +62,7 @@ def set_gpu_mode(enabled: bool) -> bool:
 
     USE_GPU = enabled
     if enabled:
-        cuda_str = "Portable CUDA" if USING_PORTABLE_CUDA else "System CUDA"
+        cuda_str = GPU_INFO.get('backend', 'System CUDA')
         print(f"🚀 GPU acceleration ENABLED (using {cuda_str})")
     else:
         print(f"💻 Using CPU mode")

@@ -1,25 +1,68 @@
 #!/usr/bin/env python3
-"""Standalone Qwen3-VL semantic tagging worker via Transformers.
+"""Standalone Qwen3-VL semantic tagging worker via llama.cpp Vulkan.
 
-The main app keeps Auto Mode's candidate selection, prompt, JSON parsing, and
-merge behavior outside this worker. This process samples the same candidate
-frames and tags them with the local Qwen3-VL model using PyTorch/Transformers.
+The main app keeps Auto Mode's candidate selection and merge behavior outside
+this worker. This process samples the same candidate frames and tags them with
+the bundled Qwen3-VL GGUF model through llama.cpp. It prefers a persistent
+llama-server process so the model loads once, and falls back to llama-mtmd-cli
+when the server path is unavailable.
 """
 
 from __future__ import annotations
 
 import argparse
-import gc
+import base64
+import concurrent.futures
+import io
 import json
 import os
 import re
+import socket
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
+
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+BIN_DIR = ROOT_DIR / "bin"
+DEFAULT_LLAMA_DIR = BIN_DIR / "llama-bin-win-vulkan-x64"
+DEFAULT_MODEL = BIN_DIR / "models" / "Qwen3VL-2B-Instruct-Q8_0.gguf"
+DEFAULT_MMPROJ = BIN_DIR / "models" / "mmproj-Qwen3VL-2B-Instruct-F16.gguf"
+
+NUMERIC_KEYS = [
+    "action_intensity",
+    "beauty_score",
+    "combat",
+    "chase",
+    "explosion",
+    "character_focus",
+    "camera_motion",
+    "visual_quality",
+]
+ALLOWED_EMOTIONS = {"soft", "tension", "hype", "sad", "neutral"}
+ALLOWED_USES = {"drop", "soft", "build", "transition", "flow", "filler"}
+SEMANTIC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        key: {"type": "number", "minimum": 0, "maximum": 1}
+        for key in NUMERIC_KEYS
+    },
+    "required": NUMERIC_KEYS + ["emotion", "recommended_use", "description"],
+    "additionalProperties": False,
+}
+SEMANTIC_SCHEMA["properties"].update({
+    "emotion": {"type": "string", "enum": sorted(ALLOWED_EMOTIONS)},
+    "recommended_use": {"type": "string", "enum": sorted(ALLOWED_USES)},
+    "description": {"type": "string"},
+})
 
 
 def _parse_args() -> argparse.Namespace:
@@ -39,6 +82,14 @@ def _clamp(value, lo: float = 0.0, hi: float = 1.0, default: float = 0.0) -> flo
     return max(lo, min(hi, v))
 
 
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(lo, min(hi, value))
+
+
 def _parse_json_object(text: str) -> Dict:
     if not text:
         return {}
@@ -54,11 +105,25 @@ def _parse_json_object(text: str) -> Dict:
 
 
 def _qwen_frame_width() -> int:
-    try:
-        value = int(os.environ.get("BEATSYNC_QWEN_FRAME_WIDTH", "512"))
-    except ValueError:
-        value = 512
-    return max(224, min(value, 768))
+    return _env_int("BEATSYNC_QWEN_FRAME_WIDTH", 512, lo=224, hi=768)
+
+
+def _max_new_tokens() -> int:
+    return _env_int("BEATSYNC_QWEN_MAX_NEW_TOKENS", 128, lo=32, hi=256)
+
+
+def _ctx_sizes() -> List[int]:
+    primary = _env_int("BEATSYNC_QWEN_LLAMA_CTX", 8192, lo=1024, hi=262144)
+    fallback = _env_int("BEATSYNC_QWEN_LLAMA_CTX_FALLBACK", 4096, lo=1024, hi=262144)
+    sizes = []
+    for value in [primary, fallback]:
+        if value not in sizes:
+            sizes.append(value)
+    return sizes
+
+
+def _llama_slots() -> int:
+    return _env_int("BEATSYNC_QWEN_LLAMA_SLOTS", 16, lo=1, hi=32)
 
 
 def _resize_frame(frame, max_width: int = 512):
@@ -174,111 +239,33 @@ def _configure_opencv_ffmpeg_threads() -> int:
 
 
 def _normalize_semantic(data: Dict) -> Dict:
+    if not isinstance(data, dict):
+        return {}
+
     out = {}
-    for key in [
-        "action_intensity",
-        "beauty_score",
-        "combat",
-        "chase",
-        "explosion",
-        "character_focus",
-        "camera_motion",
-        "visual_quality",
-    ]:
-        if key in data:
-            out[key] = _clamp(data[key])
-    for key in ["emotion", "recommended_use", "description"]:
-        if data.get(key):
-            out[key] = str(data[key])[:160]
+    for key in NUMERIC_KEYS:
+        if key not in data:
+            return {}
+        out[key] = _clamp(data[key])
+
+    emotion = str(data.get("emotion", "")).strip().lower()
+    if emotion not in ALLOWED_EMOTIONS:
+        return {}
+    recommended_use = str(data.get("recommended_use", "")).strip().lower()
+    if recommended_use not in ALLOWED_USES:
+        return {}
+
+    description = str(data.get("description", "")).strip()
+    if not description:
+        return {}
+    out["emotion"] = emotion
+    out["recommended_use"] = recommended_use
+    out["description"] = description[:160]
     return out
 
 
-def _detect_cuda_memory_gb() -> Tuple[float, float]:
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return 0.0, 0.0
-        free_bytes, total_bytes = torch.cuda.mem_get_info(0)
-        return float(total_bytes) / (1024 ** 3), float(free_bytes) / (1024 ** 3)
-    except Exception:
-        return 0.0, 0.0
-
-
-def _adaptive_qwen_batch_size(total_gb: float, free_gb: float) -> int:
-    if total_gb <= 0:
-        return 1
-    elif total_gb <= 8.5:
-        total_cap = 4
-    elif total_gb <= 12.5:
-        total_cap = 16
-    elif total_gb <= 18.0:
-        total_cap = 96
-    else:
-        total_cap = 128
-
-    try:
-        reserve_gb = float(os.environ.get("BEATSYNC_QWEN_VRAM_RESERVE_GB", "0"))
-    except ValueError:
-        reserve_gb = 0.0
-    if reserve_gb <= 0:
-        reserve_gb = max(1.75, total_gb * 0.12)
-
-    if total_gb <= 8.5:
-        default_per_item_gb = 0.50
-    elif total_gb <= 12.5:
-        default_per_item_gb = 0.25
-    else:
-        default_per_item_gb = 0.07
-    try:
-        per_item_gb = float(os.environ.get("BEATSYNC_QWEN_BATCH_ITEM_GB", str(default_per_item_gb)))
-    except ValueError:
-        per_item_gb = default_per_item_gb
-    per_item_gb = max(0.03, per_item_gb)
-
-    max_batch_is_override = "BEATSYNC_QWEN_MAX_BATCH_SIZE" in os.environ
-    try:
-        max_batch = int(os.environ.get("BEATSYNC_QWEN_MAX_BATCH_SIZE", "96"))
-    except ValueError:
-        max_batch = 96
-    max_batch = max(1, min(max_batch, 128))
-    if max_batch_is_override:
-        total_cap = max(total_cap, max_batch)
-
-    usable_gb = max(0.0, free_gb - reserve_gb)
-    free_cap = max(1, int(usable_gb // per_item_gb))
-    return max(1, min(total_cap, free_cap, max_batch))
-
-
-def _qwen_batch_size(_use_cuda: bool = True) -> int:
-    total_gb, free_gb = _detect_cuda_memory_gb()
-    default_size = _adaptive_qwen_batch_size(total_gb, free_gb)
-    try:
-        value = int(os.environ.get("BEATSYNC_QWEN_BATCH_SIZE", str(default_size)))
-    except ValueError:
-        value = default_size
-    value = max(1, min(value, 128))
-    if total_gb > 0:
-        source = "env override" if "BEATSYNC_QWEN_BATCH_SIZE" in os.environ else "adaptive"
-        print(
-            f"Qwen VRAM: total {total_gb:.1f} GB, free {free_gb:.1f} GB after model load; "
-            f"batch {value} ({source})",
-            flush=True,
-        )
-    return value
-
-
-def _cuda_peak_used_gb(torch_module) -> float:
-    try:
-        if not torch_module.cuda.is_available():
-            return 0.0
-        free_bytes, total_bytes = torch_module.cuda.mem_get_info(0)
-        driver_used = float(total_bytes - free_bytes) / (1024 ** 3)
-        reserved = float(torch_module.cuda.max_memory_reserved(0)) / (1024 ** 3)
-        allocated = float(torch_module.cuda.max_memory_allocated(0)) / (1024 ** 3)
-        return max(driver_used, reserved, allocated)
-    except Exception:
-        return 0.0
+def _semantic_from_text(text: str) -> Dict:
+    return _normalize_semantic(_parse_json_object(text))
 
 
 def _build_prompt(audio_profile: Dict) -> str:
@@ -294,174 +281,722 @@ def _build_prompt(audio_profile: Dict) -> str:
     )
 
 
-class QwenTransformersClient:
-    def __init__(self, model_path: str) -> None:
+def _safe_file_token(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)[:80] or "item"
+
+
+def _image_png_bytes(image: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _image_data_uri(image: Image.Image) -> str:
+    encoded = base64.b64encode(_image_png_bytes(image)).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _response_prefix(response_path: str) -> Path:
+    return Path(response_path).with_suffix("")
+
+
+def _tail(path: Path, limit: int = 2000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    return text[-limit:]
+
+
+def _append_log(path: Path, title: str, text: str) -> None:
+    if not text:
+        return
+    with path.open("a", encoding="utf-8", errors="replace") as f:
+        f.write(f"\n----- {title} -----\n")
+        f.write(text)
+        if not text.endswith("\n"):
+            f.write("\n")
+
+
+def _is_context_or_memory_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in lowered for token in [
+        "out of memory",
+        "memory allocation",
+        "failed to allocate",
+        "context",
+        "ctx",
+        "kv cache",
+        "vram",
+    ])
+
+
+class LlamaPaths:
+    def __init__(self, model_path: str | None) -> None:
+        self.llama_dir = Path(os.environ.get("BEATSYNC_QWEN_LLAMA_DIR", str(DEFAULT_LLAMA_DIR)))
+        self.server_exe = self.llama_dir / "llama-server.exe"
+        self.mtmd_exe = self.llama_dir / "llama-mtmd-cli.exe"
+        self.list_exe = self.llama_dir / "llama-cli.exe"
+        self.model = self._resolve_model(model_path)
+        self.mmproj = self._resolve_mmproj()
+
+    def _resolve_model(self, model_path: str | None) -> Path:
+        env_model = os.environ.get("BEATSYNC_QWEN_LLAMA_MODEL")
+        if env_model:
+            return Path(env_model)
+        if model_path:
+            requested = Path(model_path)
+            if requested.is_file() and requested.suffix.lower() == ".gguf":
+                return requested
+            candidates = [
+                requested / DEFAULT_MODEL.name,
+                requested.parent / DEFAULT_MODEL.name,
+                DEFAULT_MODEL,
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    return candidate
+        return DEFAULT_MODEL
+
+    def _resolve_mmproj(self) -> Path:
+        env_mmproj = os.environ.get("BEATSYNC_QWEN_LLAMA_MMPROJ")
+        if env_mmproj:
+            return Path(env_mmproj)
+        candidates = [
+            self.model.parent / DEFAULT_MMPROJ.name,
+            DEFAULT_MMPROJ,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return DEFAULT_MMPROJ
+
+    def validate(self) -> None:
+        missing = [
+            str(path)
+            for path in [self.server_exe, self.mtmd_exe, self.model, self.mmproj]
+            if not path.exists()
+        ]
+        if missing:
+            raise FileNotFoundError("Missing llama.cpp/Qwen files: " + "; ".join(missing))
+
+    @property
+    def model_id(self) -> str:
+        return self.model.stem
+
+
+def _llama_env(paths: LlamaPaths) -> Dict[str, str]:
+    env = os.environ.copy()
+    path_parts = [str(paths.llama_dir)]
+    for part in env.get("PATH", "").split(os.pathsep):
+        if part and os.path.normcase(os.path.abspath(part)) != os.path.normcase(str(paths.llama_dir)):
+            path_parts.append(part)
+    env["PATH"] = os.pathsep.join(path_parts)
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
+
+
+def _parse_devices(text: str) -> List[Dict[str, Any]]:
+    devices = []
+    pattern = re.compile(r"^\s*(Vulkan\d+):\s*(.+?)\s*\((\d+)\s+MiB,\s*(\d+)\s+MiB free\)", re.I)
+    for line in text.splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        name = match.group(2).strip()
+        lower = name.lower()
+        integrated = any(token in lower for token in [
+            "radeon(tm) graphics",
+            "integrated",
+            "uhd",
+            "iris",
+            "vega",
+        ])
+        discrete = any(token in lower for token in [
+            "nvidia",
+            "geforce",
+            "rtx",
+            "gtx",
+            "quadro",
+            "radeon rx",
+            "arc",
+        ]) and not integrated
+        devices.append({
+            "id": match.group(1),
+            "name": name,
+            "total_mib": int(match.group(3)),
+            "free_mib": int(match.group(4)),
+            "discrete": discrete,
+            "integrated": integrated,
+        })
+    return devices
+
+
+def _adaptive_llama_slots(device: Dict[str, Any] | None = None) -> int:
+    if "BEATSYNC_QWEN_LLAMA_SLOTS" in os.environ:
+        return _llama_slots()
+    if not device:
+        return 4
+    free_mib = int(device.get("free_mib") or 0)
+    if free_mib >= 14 * 1024:
+        return 16
+    if free_mib >= 10 * 1024:
+        return 8
+    if free_mib >= 6 * 1024:
+        return 4
+    return 2
+
+
+def _select_vulkan_device(paths: LlamaPaths) -> Tuple[str | None, str]:
+    override = os.environ.get("BEATSYNC_QWEN_LLAMA_DEVICE", "").strip()
+    if override:
+        if override.lower() in {"none", "cpu"}:
+            return None, "CPU/no Vulkan override"
+        return override, f"{override} (env override)"
+
+    try:
+        result = subprocess.run(
+            [str(paths.list_exe), "--list-devices"],
+            cwd=str(paths.llama_dir),
+            env=_llama_env(paths),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+    except Exception as exc:
+        return None, f"device list unavailable: {exc}"
+
+    devices = _parse_devices((result.stdout or "") + "\n" + (result.stderr or ""))
+    if not devices:
+        return None, "no Vulkan devices reported"
+
+    discrete = [device for device in devices if device["discrete"]]
+    pool = discrete or devices
+    selected = max(pool, key=lambda item: (item["free_mib"], item["total_mib"]))
+    return selected["id"], f"{selected['id']}: {selected['name']}"
+
+
+def _select_vulkan_device_info(paths: LlamaPaths) -> Tuple[str | None, str, Dict[str, Any] | None]:
+    override = os.environ.get("BEATSYNC_QWEN_LLAMA_DEVICE", "").strip()
+    if override:
+        if override.lower() in {"none", "cpu"}:
+            return None, "CPU/no Vulkan override", None
+        return override, f"{override} (env override)", None
+
+    try:
+        result = subprocess.run(
+            [str(paths.list_exe), "--list-devices"],
+            cwd=str(paths.llama_dir),
+            env=_llama_env(paths),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+    except Exception as exc:
+        return None, f"device list unavailable: {exc}", None
+
+    devices = _parse_devices((result.stdout or "") + "\n" + (result.stderr or ""))
+    if not devices:
+        return None, "no Vulkan devices reported", None
+
+    discrete = [device for device in devices if device["discrete"]]
+    pool = discrete or devices
+    selected = max(pool, key=lambda item: (item["free_mib"], item["total_mib"]))
+    return selected["id"], f"{selected['id']}: {selected['name']}", selected
+
+
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _http_json(method: str, url: str, payload: Dict | None = None, timeout: float = 30.0) -> Dict:
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+    if not raw.strip():
+        return {}
+    return json.loads(raw)
+
+
+class LlamaServerClient:
+    def __init__(
+        self,
+        paths: LlamaPaths,
+        device: str | None,
+        ctx_size: int,
+        response_path: str,
+        slots: int,
+    ) -> None:
+        self.paths = paths
+        self.device = device
+        self.ctx_size = ctx_size
+        self.port = _free_tcp_port()
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self.slots = max(1, min(32, int(slots)))
+        prefix = _response_prefix(response_path)
+        self.stdout_path = prefix.with_name(prefix.name + f"_llama_server_ctx{ctx_size}_stdout.log")
+        self.stderr_path = prefix.with_name(prefix.name + f"_llama_server_ctx{ctx_size}_stderr.log")
+        self._stdout_handle = self.stdout_path.open("w", encoding="utf-8", errors="replace")
+        self._stderr_handle = self.stderr_path.open("w", encoding="utf-8", errors="replace")
+        self.process: subprocess.Popen | None = None
+        self.load_seconds = 0.0
+        self._start()
+
+    def _start(self) -> None:
+        args = [
+            str(self.paths.server_exe),
+            "-m", str(self.paths.model),
+            "--mmproj", str(self.paths.mmproj),
+            "--host", "127.0.0.1",
+            "--port", str(self.port),
+            "--ctx-size", str(self.ctx_size),
+            "--batch-size", "2048",
+            "--ubatch-size", "512",
+            "--gpu-layers", "all",
+            "--split-mode", "none",
+            "--parallel", str(self.slots),
+            "--cont-batching",
+            "--timeout", "3600",
+            "--mmproj-offload",
+            "--reasoning", "off",
+            "--alias", "qwen3vl",
+            "--log-verbosity", "1",
+            "--no-log-prefix",
+        ]
+        if self.device:
+            args.extend(["--device", self.device])
+
         started = time.perf_counter()
-        import torch
-        from transformers import AutoModelForImageTextToText, AutoProcessor
-
-        self.torch = torch
-        self.model_id = os.path.basename(os.path.normpath(model_path)) or model_path
-        self.processor = AutoProcessor.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            local_files_only=True,
+        self.process = subprocess.Popen(
+            args,
+            cwd=str(self.paths.llama_dir),
+            env=_llama_env(self.paths),
+            stdout=self._stdout_handle,
+            stderr=self._stderr_handle,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
-        if torch.cuda.is_available():
-            torch.backends.cuda.matmul.allow_tf32 = True
+        ready_timeout = _env_int("BEATSYNC_QWEN_LLAMA_SERVER_READY_TIMEOUT", 180, lo=15, hi=900)
+        deadline = time.perf_counter() + ready_timeout
+        last_error = ""
+        while time.perf_counter() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(
+                    f"llama-server exited with {self.process.returncode}; "
+                    f"stderr: {_tail(self.stderr_path)}"
+                )
+            for endpoint in ["/health", "/v1/models"]:
+                try:
+                    _http_json("GET", self.base_url + endpoint, timeout=2.0)
+                    self.load_seconds = time.perf_counter() - started
+                    return
+                except Exception as exc:
+                    last_error = str(exc)
+            time.sleep(0.5)
+        raise TimeoutError(f"llama-server readiness timed out after {ready_timeout}s: {last_error}")
+
+    def close(self) -> None:
+        process = self.process
+        self.process = None
+        if process and process.poll() is None:
+            process.terminate()
             try:
-                torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+        self._stdout_handle.close()
+        self._stderr_handle.close()
 
-        dtype = self._torch_dtype()
-        model_kwargs: Dict[str, Any] = {
-            "trust_remote_code": True,
-            "local_files_only": True,
-            "low_cpu_mem_usage": True,
-            "dtype": dtype,
-        }
-        if torch.cuda.is_available():
-            model_kwargs["device_map"] = "auto"
-            model_kwargs["attn_implementation"] = os.environ.get("BEATSYNC_QWEN_ATTN", "sdpa")
-
-        try:
-            self.model = AutoModelForImageTextToText.from_pretrained(model_path, **model_kwargs)
-        except TypeError:
-            model_kwargs.pop("attn_implementation", None)
-            model_kwargs["torch_dtype"] = model_kwargs.pop("dtype")
-            self.model = AutoModelForImageTextToText.from_pretrained(model_path, **model_kwargs)
-
-        if not torch.cuda.is_available():
-            self.model.to("cpu")
-        self.model.eval()
-        self.device = self._model_device()
-        self.max_new_tokens = self._max_new_tokens()
-        self.load_seconds = time.perf_counter() - started
-        print(
-            f"Qwen Transformers model ready: {self.model_id}; device: {self.device}; "
-            f"dtype: {dtype}; load {self.load_seconds:.1f}s",
-            flush=True,
-        )
-
-    def _torch_dtype(self):
-        torch = self.torch
-        requested = os.environ.get("BEATSYNC_QWEN_TORCH_DTYPE", "auto").lower()
-        if requested == "float32":
-            return torch.float32
-        if requested == "float16":
-            return torch.float16
-        if requested == "bfloat16":
-            return torch.bfloat16
-        if not torch.cuda.is_available():
-            return torch.float32
-        try:
-            return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        except Exception:
-            return torch.float16
-
-    def _model_device(self):
-        try:
-            return next(self.model.parameters()).device
-        except StopIteration:
-            return self.torch.device("cuda:0" if self.torch.cuda.is_available() else "cpu")
-
-    @staticmethod
-    def _max_new_tokens() -> int:
-        try:
-            value = int(os.environ.get("BEATSYNC_QWEN_MAX_NEW_TOKENS", "128"))
-        except ValueError:
-            value = 128
-        return max(32, min(value, 256))
-
-    def _inputs_for_images(self, images: List[Image.Image], prompt: str) -> Dict[str, Any]:
-        texts = []
-        for image in images:
-            messages = [{
+    def generate(self, image: Image.Image, prompt: str) -> str:
+        if not self.process or self.process.poll() is not None:
+            raise RuntimeError("llama-server is not running")
+        timeout = float(_env_int("BEATSYNC_QWEN_LLAMA_HTTP_TIMEOUT", 240, lo=30, hi=1800))
+        payload = {
+            "model": "qwen3vl",
+            "messages": [{
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": image},
+                    {"type": "image_url", "image_url": {"url": _image_data_uri(image)}},
                     {"type": "text", "text": prompt},
                 ],
-            }]
-            texts.append(
-                self.processor.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+            }],
+            "temperature": 0,
+            "top_k": 1,
+            "top_p": 1,
+            "min_p": 0,
+            "max_tokens": _max_new_tokens(),
+            "stream": False,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "beatsync_semantic_tag",
+                    "strict": True,
+                    "schema": SEMANTIC_SCHEMA,
+                },
+            },
+        }
+        try:
+            data = _http_json("POST", self.base_url + "/v1/chat/completions", payload, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"llama-server HTTP {exc.code}: {body}") from exc
+
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        content = message.get("content", "")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    parts.append(str(part.get("text") or ""))
+                else:
+                    parts.append(str(part))
+            return "".join(parts)
+        return str(content)
+
+
+class LlamaMtmdClient:
+    def __init__(self, paths: LlamaPaths, device: str | None, ctx_size: int, response_path: str) -> None:
+        self.paths = paths
+        self.device = device
+        self.ctx_size = ctx_size
+        prefix = _response_prefix(response_path)
+        self.stdout_path = prefix.with_name(prefix.name + "_llama_cli_stdout.log")
+        self.stderr_path = prefix.with_name(prefix.name + "_llama_cli_stderr.log")
+        self.frame_dir = prefix.with_name(prefix.name + "_llama_frames")
+        self.frame_dir.mkdir(parents=True, exist_ok=True)
+
+    def generate(self, image: Image.Image, prompt: str, item_id: str) -> str:
+        image_path = self.frame_dir / f"{_safe_file_token(item_id)}.png"
+        image.save(image_path, format="PNG")
+        args = [
+            str(self.paths.mtmd_exe),
+            "-m", str(self.paths.model),
+            "--mmproj", str(self.paths.mmproj),
+            "--image", str(image_path),
+            "-p", prompt,
+            "-n", str(_max_new_tokens()),
+            "--ctx-size", str(self.ctx_size),
+            "--batch-size", "2048",
+            "--ubatch-size", "512",
+            "--gpu-layers", "all",
+            "--split-mode", "none",
+            "--mmproj-offload",
+            "--temp", "0",
+            "--top-k", "1",
+            "--top-p", "1",
+            "--min-p", "0",
+            "--json-schema", json.dumps(SEMANTIC_SCHEMA, separators=(",", ":")),
+            "--no-warmup",
+            "--log-verbosity", "1",
+            "--no-log-prefix",
+        ]
+        if self.device:
+            args.extend(["--device", self.device])
+
+        timeout = _env_int("BEATSYNC_QWEN_LLAMA_CLI_TIMEOUT", 300, lo=30, hi=3600)
+        started = time.perf_counter()
+        try:
+            result = subprocess.run(
+                args,
+                cwd=str(self.paths.llama_dir),
+                env=_llama_env(self.paths),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        return self.processor(
-            text=texts,
-            images=images,
-            padding=True,
-            return_tensors="pt",
-        )
+        except subprocess.TimeoutExpired:
+            _append_log(self.stderr_path, f"{item_id} timeout", f"Timed out after {timeout}s")
+            return ""
 
-    def generate_batch(self, images: List[Image.Image], prompt: str) -> List[str]:
-        torch = self.torch
-        inputs = self._inputs_for_images(images, prompt)
-        inputs = {
-            key: value.to(self.device) if hasattr(value, "to") else value
-            for key, value in inputs.items()
-        }
-        generation_kwargs: Dict[str, Any] = {
-            "max_new_tokens": self.max_new_tokens,
-            "do_sample": False,
-            "use_cache": True,
-        }
-        with torch.inference_mode():
-            output_ids = self.model.generate(**inputs, **generation_kwargs)
-        prompt_len = int(inputs["input_ids"].shape[1])
-        generated_ids = output_ids[:, prompt_len:]
-        return self.processor.batch_decode(generated_ids, skip_special_tokens=True)
-
-    def clear_cache(self) -> None:
-        gc.collect()
-        if self.torch.cuda.is_available():
-            self.torch.cuda.empty_cache()
-
-
-def _is_out_of_memory(exc: BaseException) -> bool:
-    message = str(exc).lower()
-    return "out of memory" in message or "cuda error: out of memory" in message
+        elapsed = time.perf_counter() - started
+        _append_log(self.stdout_path, f"{item_id} stdout ({elapsed:.1f}s)", result.stdout or "")
+        _append_log(self.stderr_path, f"{item_id} stderr ({elapsed:.1f}s)", result.stderr or "")
+        if result.returncode == 3221225786:
+            _append_log(
+                self.stderr_path,
+                f"{item_id} interrupted",
+                "llama-mtmd-cli exited with 3221225786 / 0xC000013A, usually an interruption.",
+            )
+            return ""
+        if result.returncode != 0:
+            combined = (result.stdout or "") + "\n" + (result.stderr or "")
+            fallback_ctx = _ctx_sizes()[-1]
+            if self.ctx_size != fallback_ctx and _is_context_or_memory_error(combined):
+                _append_log(
+                    self.stderr_path,
+                    f"{item_id} ctx fallback",
+                    f"Retrying llama-mtmd-cli with ctx {fallback_ctx} after exit code {result.returncode}.",
+                )
+                self.ctx_size = fallback_ctx
+                return self.generate(image, prompt, item_id)
+            _append_log(self.stderr_path, f"{item_id} exit", f"Exit code {result.returncode}")
+            return ""
+        return result.stdout or ""
 
 
-def _generate_semantics_batch(
-    client: QwenTransformersClient,
-    batch_items: List[Dict],
+class QwenLlamaClient:
+    def __init__(self, model_path: str | None, response_path: str) -> None:
+        self.paths = LlamaPaths(model_path)
+        self.paths.validate()
+        self.device, self.device_label, self.device_info = _select_vulkan_device_info(self.paths)
+        self.target_slots = _adaptive_llama_slots(self.device_info)
+        self.ctx_size = _ctx_sizes()[0]
+        self.server: LlamaServerClient | None = None
+        self.cli: LlamaMtmdClient | None = None
+        self.load_seconds = 0.0
+        self.batch_size = self.target_slots
+        self.response_path = response_path
+        print(f"Qwen llama.cpp model: {self.paths.model.name}", flush=True)
+        print(f"Qwen llama.cpp mmproj: {self.paths.mmproj.name}", flush=True)
+        print(f"Qwen llama.cpp Vulkan device: {self.device_label}", flush=True)
+        print(f"Qwen llama.cpp target slots: {self.target_slots}", flush=True)
+        self._start_server_or_prepare_cli()
+
+    @property
+    def model_id(self) -> str:
+        return f"{self.paths.model_id} (llama.cpp Vulkan)"
+
+    def _start_server_or_prepare_cli(self) -> None:
+        if os.environ.get("BEATSYNC_QWEN_LLAMA_DISABLE_SERVER", "0") == "1":
+            self._prepare_cli(_ctx_sizes()[0])
+            print("Qwen llama.cpp server disabled; using llama-mtmd-cli fallback", flush=True)
+            return
+
+        last_error = ""
+        for ctx_size in _ctx_sizes():
+            try:
+                self.server = LlamaServerClient(
+                    self.paths,
+                    self.device,
+                    ctx_size,
+                    self.response_path,
+                    self.target_slots,
+                )
+                self.ctx_size = ctx_size
+                self.load_seconds = self.server.load_seconds
+                self.batch_size = self.server.slots
+                print(
+                    f"Qwen llama-server ready: ctx {ctx_size}, slots {self.batch_size}, "
+                    f"load {self.load_seconds:.1f}s",
+                    flush=True,
+                )
+                return
+            except Exception as exc:
+                last_error = str(exc)
+                print(f"Qwen llama-server ctx {ctx_size} failed: {last_error[-600:]}", flush=True)
+                if self.server:
+                    self.server.close()
+                    self.server = None
+        self._prepare_cli(_ctx_sizes()[-1])
+        print(f"Qwen falling back to llama-mtmd-cli: {last_error[-600:]}", flush=True)
+
+    def _prepare_cli(self, ctx_size: int) -> None:
+        self.server = None
+        self.ctx_size = ctx_size
+        self.batch_size = 1
+        self.cli = LlamaMtmdClient(self.paths, self.device, ctx_size, self.response_path)
+
+    def restart_server_with_slots(self, slots: int) -> bool:
+        if os.environ.get("BEATSYNC_QWEN_LLAMA_DISABLE_SERVER", "0") == "1":
+            return False
+        if self.server:
+            self.server.close()
+            self.server = None
+        self.cli = None
+        self.target_slots = max(1, min(32, int(slots)))
+        try:
+            self.server = LlamaServerClient(
+                self.paths,
+                self.device,
+                self.ctx_size,
+                self.response_path,
+                self.target_slots,
+            )
+            self.load_seconds += self.server.load_seconds
+            self.batch_size = self.server.slots
+            print(
+                f"Qwen llama-server restarted: ctx {self.ctx_size}, slots {self.batch_size}, "
+                f"load {self.server.load_seconds:.1f}s",
+                flush=True,
+            )
+            return True
+        except Exception as exc:
+            print(f"Qwen llama-server restart failed: {str(exc)[-600:]}", flush=True)
+            if self.server:
+                self.server.close()
+                self.server = None
+            self._prepare_cli(self.ctx_size)
+            return False
+
+    def generate(self, image: Image.Image, prompt: str, item_id: str) -> str:
+        if self.server:
+            try:
+                return self.server.generate(image, prompt)
+            except Exception as exc:
+                fallback_ctx = _ctx_sizes()[-1]
+                if self.ctx_size != fallback_ctx and _is_context_or_memory_error(str(exc)):
+                    print(
+                        f"Qwen llama-server request hit context/VRAM limits; retrying ctx {fallback_ctx}",
+                        flush=True,
+                    )
+                    self.server.close()
+                    self.server = None
+                    try:
+                        self.server = LlamaServerClient(
+                            self.paths,
+                            self.device,
+                            fallback_ctx,
+                            self.response_path,
+                            self.target_slots,
+                        )
+                        self.ctx_size = fallback_ctx
+                        self.load_seconds += self.server.load_seconds
+                        self.batch_size = self.server.slots
+                        return self.server.generate(image, prompt)
+                    except Exception as retry_exc:
+                        print(f"Qwen llama-server ctx {fallback_ctx} retry failed: {retry_exc}", flush=True)
+                print(f"Qwen llama-server request failed; switching to CLI fallback: {exc}", flush=True)
+                if self.server:
+                    self.server.close()
+                self.server = None
+                self._prepare_cli(self.ctx_size)
+        if not self.cli:
+            self._prepare_cli(self.ctx_size)
+        return self.cli.generate(image, prompt, item_id)
+
+    def close(self) -> None:
+        if self.server:
+            self.server.close()
+            self.server = None
+
+
+def _candidate_id(item: Dict, fallback_index: int = 0) -> str:
+    return str(item["candidate"].get("id") or fallback_index)
+
+
+def _generate_with_server(
+    client: QwenLlamaClient,
+    item: Dict,
     prompt: str,
-) -> Dict[str, Dict]:
-    semantics: Dict[str, Dict] = {}
-    images = [item["image"] for item in batch_items]
+    fallback_index: int = 0,
+) -> Tuple[str, Dict, str]:
+    item_id = _candidate_id(item, fallback_index)
+    if not client.server:
+        return item_id, {}, "llama-server is not running"
     try:
-        texts = client.generate_batch(images, prompt)
-    except RuntimeError as exc:
-        if len(batch_items) <= 1 or not _is_out_of_memory(exc):
-            raise
-        split_at = max(1, len(batch_items) // 2)
+        text = client.server.generate(item["image"], prompt)
+    except Exception as exc:
+        return item_id, {}, str(exc)
+    return item_id, _semantic_from_text(text), ""
+
+
+def _generate_serial(
+    client: QwenLlamaClient,
+    item: Dict,
+    prompt: str,
+    fallback_index: int = 0,
+) -> Tuple[str, Dict, str]:
+    item_id = _candidate_id(item, fallback_index)
+    try:
+        text = client.generate(item["image"], prompt, item_id)
+    except Exception as exc:
+        return item_id, {}, str(exc)
+    return item_id, _semantic_from_text(text), ""
+
+
+def _run_inference_wave(
+    client: QwenLlamaClient,
+    wave_items: List[Dict],
+    prompt: str,
+    base_index: int,
+) -> Dict[str, Dict]:
+    if not wave_items:
+        return {}
+
+    semantics: Dict[str, Dict] = {}
+    failed: List[Tuple[int, Dict, str]] = []
+    server = client.server
+    concurrency = max(1, int(client.batch_size or 1))
+
+    if server and concurrency > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+            future_to_item = {
+                executor.submit(_generate_with_server, client, item, prompt, base_index + offset): (offset, item)
+                for offset, item in enumerate(wave_items, 1)
+            }
+            for future in concurrent.futures.as_completed(future_to_item):
+                offset, item = future_to_item[future]
+                try:
+                    item_id, semantic, error = future.result()
+                except Exception as exc:
+                    item_id, semantic, error = _candidate_id(item, base_index + offset), {}, str(exc)
+                if semantic:
+                    semantics[item_id] = semantic
+                else:
+                    failed.append((offset, item, error))
+    else:
+        for offset, item in enumerate(wave_items, 1):
+            item_id, semantic, error = _generate_serial(client, item, prompt, base_index + offset)
+            if semantic:
+                semantics[item_id] = semantic
+            else:
+                failed.append((offset, item, error))
+
+    if failed and client.server:
+        retry_failed: List[Tuple[int, Dict, str]] = []
+        for offset, item, _error in failed:
+            item_id, semantic, error = _generate_with_server(client, item, prompt, base_index + offset)
+            if semantic:
+                semantics[item_id] = semantic
+            else:
+                retry_failed.append((offset, item, error))
+        failed = retry_failed
+
+    valid_ratio = len(semantics) / max(1, len(wave_items))
+    if failed and client.server and client.batch_size > 1 and valid_ratio < 0.70:
+        reduced_slots = max(1, int(client.batch_size) // 2)
         print(
-            f"Qwen batch of {len(batch_items)} hit GPU memory; retrying as "
-            f"{split_at}+{len(batch_items) - split_at}.",
+            f"Qwen llama.cpp wave valid ratio {valid_ratio:.0%}; retrying with {reduced_slots} slots",
             flush=True,
         )
-        client.clear_cache()
-        semantics.update(_generate_semantics_batch(client, batch_items[:split_at], prompt))
-        semantics.update(_generate_semantics_batch(client, batch_items[split_at:], prompt))
-        return semantics
+        if client.restart_server_with_slots(reduced_slots):
+            return _run_inference_wave(client, wave_items, prompt, base_index)
 
-    for item, text in zip(batch_items, texts):
-        parsed = _normalize_semantic(_parse_json_object(text))
-        if parsed:
-            semantics[str(item["candidate"]["id"])] = parsed
+    if failed and not client.server:
+        for offset, item, _error in failed:
+            item_id, semantic, _error = _generate_serial(client, item, prompt, base_index + offset)
+            if semantic:
+                semantics[item_id] = semantic
+
     return semantics
 
 
 def _run_semantics_for_video(
     *,
-    client: QwenTransformersClient,
-    batch_size: int,
+    client: QwenLlamaClient,
     video_file: str,
     fps: float,
     candidates: List[Dict],
@@ -487,27 +1022,22 @@ def _run_semantics_for_video(
         inference_started = time.perf_counter()
         idx = 0
         while idx < len(frame_items):
-            scan_end = min(len(frame_items), idx + batch_size)
-            batch_items = frame_items[idx:scan_end]
-            if not batch_items:
-                break
-            semantics.update(
-                _generate_semantics_batch(
-                    client=client,
-                    batch_items=batch_items,
-                    prompt=prompt,
-                )
+            wave_size = max(1, int(client.batch_size or 1))
+            wave_items = frame_items[idx:idx + wave_size]
+            semantics.update(_run_inference_wave(client, wave_items, prompt, idx))
+            idx += len(wave_items)
+            elapsed = max(0.001, time.perf_counter() - inference_started)
+            rate = idx / elapsed
+            print(
+                f"Qwen llama.cpp tagged {idx}/{len(frame_items)} "
+                f"({rate:.2f}/s, batch {client.batch_size})",
+                flush=True,
             )
-            idx = scan_end
-            if idx % 10 == 0 or idx >= len(frame_items):
-                elapsed = max(0.001, time.perf_counter() - inference_started)
-                rate = idx / elapsed
-                print(f"Qwen tagged {idx}/{len(frame_items)} ({rate:.2f}/s)", flush=True)
         elapsed = max(0.001, time.perf_counter() - inference_started)
         timings["inference_seconds"] = elapsed
         timings["tag_count"] = len(semantics)
         print(
-            f"Qwen semantic inference total: {len(semantics)}/{len(frame_items)} tags "
+            f"Qwen llama.cpp semantic inference total: {len(semantics)}/{len(frame_items)} tags "
             f"in {elapsed:.1f}s ({len(frame_items) / elapsed:.2f} candidates/s)",
             flush=True,
         )
@@ -522,14 +1052,11 @@ def main() -> None:
     with open(args.request, "r", encoding="utf-8") as f:
         request = json.load(f)
 
-    model_path = request["qwen_model_path"]
+    model_path = request.get("qwen_model_path")
     audio_profile = request.get("audio_profile") or {}
     prompt = _build_prompt(audio_profile)
 
-    client = QwenTransformersClient(model_path)
-    batch_size = _qwen_batch_size(True)
-    print(f"Qwen Transformers batch size: {batch_size}", flush=True)
-
+    client = QwenLlamaClient(model_path, args.response)
     jobs = request.get("jobs")
     if not jobs:
         jobs = [{
@@ -544,34 +1071,35 @@ def main() -> None:
 
     semantics_by_job: Dict[str, Dict[str, Dict]] = {}
     timings_by_job: Dict[str, Dict] = {}
-    for job_index, job in enumerate(jobs, 1):
-        job_id = str(job.get("job_id", job_index))
-        video_file = job["video_file"]
-        fps = float(job.get("fps") or 24.0)
-        candidates: List[Dict] = job.get("candidates") or []
-        print(
-            f"Qwen Transformers job {job_index}/{len(jobs)}: {os.path.basename(video_file)} "
-            f"({len(candidates)} candidates)",
-            flush=True,
-        )
-        semantics, timings = _run_semantics_for_video(
-            client=client,
-            batch_size=batch_size,
-            video_file=video_file,
-            fps=fps,
-            candidates=candidates,
-            prompt=prompt,
-        )
-        semantics_by_job[job_id] = semantics
-        timings_by_job[job_id] = timings
-        client.clear_cache()
+    try:
+        for job_index, job in enumerate(jobs, 1):
+            job_id = str(job.get("job_id", job_index))
+            video_file = job["video_file"]
+            fps = float(job.get("fps") or 24.0)
+            candidates: List[Dict] = job.get("candidates") or []
+            print(
+                f"Qwen llama.cpp job {job_index}/{len(jobs)}: {os.path.basename(video_file)} "
+                f"({len(candidates)} candidates)",
+                flush=True,
+            )
+            semantics, timings = _run_semantics_for_video(
+                client=client,
+                video_file=video_file,
+                fps=fps,
+                candidates=candidates,
+                prompt=prompt,
+            )
+            semantics_by_job[job_id] = semantics
+            timings_by_job[job_id] = timings
+    finally:
+        client.close()
 
     total_seconds = time.perf_counter() - whole_started
     response = {
         "model_load_seconds": client.load_seconds,
         "model_id": client.model_id,
-        "batch_size": batch_size,
-        "peak_vram_gb": _cuda_peak_used_gb(client.torch),
+        "batch_size": client.batch_size,
+        "peak_vram_gb": 0.0,
         "total_seconds": total_seconds,
         "timings_by_job": timings_by_job,
     }

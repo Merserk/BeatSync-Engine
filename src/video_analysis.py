@@ -33,9 +33,13 @@ from logger import ROOT_DIR, setup_environment
 
 setup_environment()
 
-ANALYSIS_VERSION = "auto_av_analysis_v6_transformers"
-DEFAULT_QWEN_MODEL_DIR = os.path.join(ROOT_DIR, "bin", "models", "Qwen3-VL-2B-Instruct")
+ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"
+DEFAULT_QWEN_MODEL_DIR = os.path.join(ROOT_DIR, "bin", "models")
+DEFAULT_QWEN_GGUF_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "Qwen3VL-2B-Instruct-Q8_0.gguf")
+DEFAULT_QWEN_MMPROJ_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "mmproj-Qwen3VL-2B-Instruct-F16.gguf")
+DEFAULT_LLAMA_CPP_DIR = os.path.join(ROOT_DIR, "bin", "llama-bin-win-vulkan-x64")
 VIDEO_ANALYSIS_CACHE_DIR = os.path.join(ROOT_DIR, "input", "video_analysis_cache")
+_LLAMA_VERSION_TOKENS: Dict[str, str] = {}
 
 
 def _clamp(value: Any, lo: float = 0.0, hi: float = 1.0, default: float = 0.0) -> float:
@@ -56,15 +60,115 @@ def _hash_text(text: str, length: int = 16) -> str:
     return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:length]
 
 
+def _resolve_qwen_backend_paths(qwen_model_path: str | None) -> Dict[str, str]:
+    llama_dir = os.environ.get("BEATSYNC_QWEN_LLAMA_DIR", DEFAULT_LLAMA_CPP_DIR)
+    model_override = os.environ.get("BEATSYNC_QWEN_LLAMA_MODEL")
+    mmproj_override = os.environ.get("BEATSYNC_QWEN_LLAMA_MMPROJ")
+
+    requested = os.path.abspath(qwen_model_path) if qwen_model_path else ""
+    if model_override:
+        model_path = os.path.abspath(model_override)
+    elif requested and os.path.isfile(requested) and requested.lower().endswith(".gguf"):
+        model_path = requested
+    else:
+        candidates = []
+        if requested:
+            candidates.extend([
+                os.path.join(requested, os.path.basename(DEFAULT_QWEN_GGUF_MODEL)),
+                os.path.join(os.path.dirname(requested), os.path.basename(DEFAULT_QWEN_GGUF_MODEL)),
+            ])
+        candidates.append(DEFAULT_QWEN_GGUF_MODEL)
+        model_path = next((path for path in candidates if os.path.exists(path)), DEFAULT_QWEN_GGUF_MODEL)
+
+    if mmproj_override:
+        mmproj_path = os.path.abspath(mmproj_override)
+    else:
+        candidates = [
+            os.path.join(os.path.dirname(model_path), os.path.basename(DEFAULT_QWEN_MMPROJ_MODEL)),
+            DEFAULT_QWEN_MMPROJ_MODEL,
+        ]
+        mmproj_path = next((path for path in candidates if os.path.exists(path)), DEFAULT_QWEN_MMPROJ_MODEL)
+
+    return {
+        "llama_dir": os.path.abspath(llama_dir),
+        "server": os.path.abspath(os.path.join(llama_dir, "llama-server.exe")),
+        "mtmd": os.path.abspath(os.path.join(llama_dir, "llama-mtmd-cli.exe")),
+        "model": os.path.abspath(model_path),
+        "mmproj": os.path.abspath(mmproj_path),
+    }
+
+
+def _qwen_backend_available(qwen_model_path: str | None) -> bool:
+    paths = _resolve_qwen_backend_paths(qwen_model_path)
+    return all(os.path.exists(paths[key]) for key in ["server", "mtmd", "model", "mmproj"])
+
+
+def _qwen_backend_model_path(qwen_model_path: str | None) -> str:
+    return _resolve_qwen_backend_paths(qwen_model_path)["model"]
+
+
+def _path_signature_token(path: str) -> str:
+    try:
+        stat = os.stat(path)
+        return f"{os.path.basename(path)}:{stat.st_size}:{int(stat.st_mtime)}"
+    except OSError:
+        return f"{os.path.basename(path)}:missing"
+
+
+def _llama_version_token(llama_dir: str) -> str:
+    llama_dir = os.path.abspath(llama_dir)
+    cached = _LLAMA_VERSION_TOKENS.get(llama_dir)
+    if cached:
+        return cached
+
+    mtmd = os.path.join(llama_dir, "llama-mtmd-cli.exe")
+    token = _path_signature_token(mtmd)
+    if os.path.exists(mtmd):
+        env = os.environ.copy()
+        env["PATH"] = llama_dir + os.pathsep + env.get("PATH", "")
+        try:
+            result = subprocess.run(
+                [mtmd, "--version"],
+                cwd=llama_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            version = ((result.stdout or "") + (result.stderr or "")).strip()
+            if version:
+                token = version.splitlines()[0][:120]
+        except Exception:
+            pass
+    _LLAMA_VERSION_TOKENS[llama_dir] = token
+    return token
+
+
+def _qwen_backend_signature_token(qwen_model_path: str | None) -> str:
+    paths = _resolve_qwen_backend_paths(qwen_model_path)
+    required = ["server", "mtmd", "model", "mmproj"]
+    if not all(os.path.exists(paths[key]) for key in required):
+        return "ai_missing"
+    raw = "|".join([
+        "llama_vulkan",
+        _path_signature_token(paths["model"]),
+        _path_signature_token(paths["mmproj"]),
+        _path_signature_token(paths["server"]),
+        _path_signature_token(paths["mtmd"]),
+        _llama_version_token(paths["llama_dir"]),
+    ])
+    return "ai_" + _hash_text(raw, length=20)
+
+
 def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | None) -> str:
     stat = os.stat(video_file)
     model_token = "no_ai"
-    if enable_ai and qwen_model_path and os.path.isdir(qwen_model_path):
-        try:
-            model_stat = os.stat(os.path.join(qwen_model_path, "config.json"))
-            model_token = f"ai_{int(model_stat.st_mtime)}"
-        except OSError:
-            model_token = "ai_unknown"
+    if enable_ai:
+        model_token = _qwen_backend_signature_token(qwen_model_path)
     raw = "|".join([
         ANALYSIS_VERSION,
         os.path.abspath(video_file),
@@ -174,7 +278,8 @@ def analyze_video_sources(
 ) -> Dict:
     """Analyze all source videos and return candidate moments for Auto Mode."""
     total_started = time.perf_counter()
-    qwen_model_path = qwen_model_path or DEFAULT_QWEN_MODEL_DIR
+    requested_qwen_model_path = qwen_model_path or DEFAULT_QWEN_MODEL_DIR
+    qwen_model_path = _qwen_backend_model_path(requested_qwen_model_path)
     existing = [os.path.abspath(p) for p in video_files if p and os.path.exists(p)]
     if not existing:
         return {
@@ -185,7 +290,9 @@ def analyze_video_sources(
             "summary": "No source videos available for analysis.",
         }
 
-    ai_available = bool(enable_ai and qwen_model_path and os.path.isdir(qwen_model_path))
+    ai_available = bool(enable_ai and _qwen_backend_available(requested_qwen_model_path))
+    if ai_available:
+        qwen_model_path = _qwen_backend_model_path(requested_qwen_model_path)
     print("\n   VIDEO ANALYSIS - Auto Mode visual library")
     print(f"   Source videos: {len(existing)}")
     print(f"   Qwen semantic tags: {'enabled' if ai_available else 'disabled/fallback'}")
@@ -264,7 +371,7 @@ def analyze_video_sources(
 
     # When the deterministic CPU-heavy pass ran in parallel, run Qwen after it in
     # original video order. A single multi-video Qwen worker is used by default so
-    # the CUDA model loads once, not once per source video.
+    # the llama.cpp model loads once, not once per source video.
     deferred_jobs = [
         job for job in jobs
         if results_by_index.get(job["index"], {}).get("ai_deferred") and ai_available
@@ -616,7 +723,7 @@ def _complete_deferred_qwen_batch(
         for video_data in job_to_video.values():
             video_data["ai_deferred"] = False
             video_data["ai_enabled"] = False
-        print("      Qwen Transformers returned no semantic response; AI analysis will retry on the next run.")
+        print("      Qwen llama.cpp returned no semantic response; AI analysis will retry on the next run.")
         print(f"      ⏱ Shared Qwen batch total: {_fmt_seconds(batch_seconds)}")
         return
     model_load_seconds = float(response.get("model_load_seconds") or 0.0)
@@ -1325,25 +1432,17 @@ def _run_qwen_worker(
 
 def _qwen_worker_environment() -> Dict[str, str]:
     env = os.environ.copy()
-    cuda_dir = os.path.join(ROOT_DIR, "bin", "CUDA", "v13.0")
-    cuda_root = os.path.normcase(cuda_dir)
-    cuda_parts = [
-        os.path.join(cuda_dir, "bin", "x64"),
-        os.path.join(cuda_dir, "bin"),
-        os.path.join(cuda_dir, "lib", "x64"),
-    ]
+    llama_dir = os.environ.get("BEATSYNC_QWEN_LLAMA_DIR", DEFAULT_LLAMA_CPP_DIR)
+    llama_root = os.path.normcase(os.path.abspath(llama_dir))
     path_parts = []
     for part in env.get("PATH", "").split(os.pathsep):
         if not part:
             continue
         norm = os.path.normcase(os.path.abspath(part))
-        if norm.startswith(cuda_root):
+        if norm == llama_root:
             continue
         path_parts.append(part)
-    env["PATH"] = os.pathsep.join(cuda_parts + path_parts)
-    env["CUDA_PATH"] = cuda_dir
-    env["CUDA_HOME"] = cuda_dir
-    env["CUDA_ROOT"] = cuda_dir
+    env["PATH"] = os.pathsep.join([llama_dir] + path_parts)
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     return env
