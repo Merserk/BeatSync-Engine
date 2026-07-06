@@ -23,8 +23,7 @@ BeatSync Engine analyzes music rhythm, energy, sections, and source-video moment
 
 [![Watch the BeatSync Engine demo video](https://img.youtube.com/vi/Iv00-5GkoOM/maxresdefault.jpg)](https://www.youtube.com/watch?v=Iv00-5GkoOM)
 
-[https://www.youtube.com/watch?v=jud_ZxxDjPg
-](https://youtu.be/jud_ZxxDjPg?si=4BqXW9eR3XYc6DNx)
+[![Watch the BeatSync Engine demo video](https://img.youtube.com/vi/jud_ZxxDjPg/maxresdefault.jpg)](https://www.youtube.com/watch?v=jud_ZxxDjPg)
 
 > Watch the special showcase video for BeatSync Engine on YouTube.
 
