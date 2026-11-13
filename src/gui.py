@@ -63,12 +63,12 @@ _install_windows_asyncio_connection_reset_filter()
 
 from logger import (
     setup_environment,
-    USING_PORTABLE_PYTHON, USING_PORTABLE_CUDA, USING_CUPY_CTK, FFMPEG_FOUND
+    USING_PORTABLE_PYTHON
 )
 
 # Initialize environment
 setup_environment()
-# NOW import other modules (after CUDA environment is set)
+# Import modules after the portable environment is set
 import gradio as gr
 import tempfile
 import shutil
@@ -76,14 +76,15 @@ import datetime
 import multiprocessing
 import queue
 import re
-import subprocess
 import threading
 import time
 import socket
 from typing import Callable, Iterator, TypeAlias, Tuple, Dict, List
 
 # Import FFmpeg processing module
-from ffmpeg_processing import get_video_fps, FFMPEG_PATH
+from ffmpeg_processing import get_video_fps, create_browser_preview
+from ffmpeg_runtime import get_runtime_info
+from video_encoders import VULKAN_ENCODERS, NVENC_ENCODERS, HARDWARE_ENCODERS, get_encoder_support
 
 # Shared runtime settings
 from gpu_cpu_utils import (
@@ -104,7 +105,7 @@ from paths import (
 )
 
 gpu_data = GPU_INFO
-gpu_info = f"{gpu_data['name']} ({gpu_data['cuda_version']})" if gpu_data['available'] else "CPU Mode"
+gpu_info = f"{gpu_data['name']} ({gpu_data['backend']})" if gpu_data['available'] else "CPU Mode"
 
 from video_processor import create_music_video
 
@@ -117,7 +118,8 @@ from ui_content import *
 os.environ['GRADIO_TEMP_DIR'] = GRADIO_TEMP_DIR
 
 VideoFilesInput : TypeAlias = List[str]
-StatusResult : TypeAlias = Tuple[str, str, Dict]
+StatusResult : TypeAlias = Tuple[str | None, str, Dict]
+ExportResult : TypeAlias = Tuple[str | None, str, str | None, Dict]
 
 STATUS_BOX_CSS = """
 #status-output-box {
@@ -233,6 +235,13 @@ def _stage5_summary(console_logger: StageConsoleLogger | None, video_analysis: D
     batch_size = int(video_analysis.get("qwen_concurrency") or 0)
 
     console_logger.line(f"Source videos: {source_count}, visual workers: {worker_count}")
+    if video_analysis.get('pipeline_order') == 'scan_all_then_qwen':
+        console_logger.line('Video pipeline: scan all sources one by one, then shared Qwen tagging')
+        console_logger.line(f"Qwen sessions this run: {video_analysis.get('qwen_worker_count', 0)}, "
+                            f"server starts: {video_analysis.get('qwen_server_start_count', 0)}")
+        visual_cache_hits = int(video_analysis.get('visual_cache_hits') or 0)
+        if visual_cache_hits:
+            console_logger.line(f'Scan/scoring cache reused for {visual_cache_hits} pending AI source(s)')
     if ai_enabled:
         qwen_bits = ["Qwen: enabled"]
         if model_id:
@@ -304,6 +313,42 @@ def _stage6_summary(console_logger: StageConsoleLogger | None, beat_info: Dict |
             f"{int(plan_summary.get('source_count') or 0)} sources, "
             f"AI moments {int(plan_summary.get('ai_tagged') or 0)}"
         )
+        console_logger.line(
+            "Planner pool: "
+            f"seed {int(plan_summary.get('highlight_seed_size') or plan_summary.get('highlight_pool_size') or 0)}, "
+            f"expanded {int(plan_summary.get('planner_pool_size') or 0)}/"
+            f"{int(plan_summary.get('planner_pool_target') or 0)}, "
+            f"raw {int(plan_summary.get('raw_candidate_size') or 0)}, "
+            f"reuse {int(plan_summary.get('candidate_reuse_count') or 0)}"
+        )
+        console_logger.line(
+            "Unique footage: "
+            f"{int(plan_summary.get('visual_verified_clip_count') or 0)}/"
+            f"{int(plan_summary.get('clip_count') or 0)} cuts checked, "
+            f"repeated scenes {int(plan_summary.get('global_scene_repetition_count') or 0)}, "
+            f"source overlaps {int(plan_summary.get('source_overlap_count') or 0)}, "
+            f"visual repeats {int(plan_summary.get('visual_duplicate_count') or 0)}, "
+            f"verification {float(plan_summary.get('visual_verification_seconds') or 0):.2f}s"
+        )
+        console_logger.line(
+            "Clean source shots: "
+            f"{int(plan_summary.get('shot_verified_clip_count') or 0)}/"
+            f"{int(plan_summary.get('clip_count') or 0)} verified, "
+            f"{int(plan_summary.get('shot_refined_clip_count') or 0)} source intervals adjusted"
+        )
+        console_logger.line(
+            "Avoid text: "
+            f"{'on' if plan_summary.get('avoid_text_clips') else 'off'}, "
+            f"filtered {int(plan_summary.get('text_candidates_filtered') or 0)}/"
+            f"{int(plan_summary.get('text_candidate_count') or 0)}, "
+            f"used {int(plan_summary.get('text_overlay_used_count') or 0)}"
+        )
+        console_logger.line(
+            "Speed control: "
+            f"{int(plan_summary.get('speed_slowed_count') or 0)} slowed, "
+            f"{int(plan_summary.get('speed_sped_up_count') or 0)} sped up, "
+            f"avg {float(plan_summary.get('average_playback_speed') or 1.0):.2f}x"
+        )
 
     final_bits = []
     if render_info.get("target_resolution"):
@@ -352,11 +397,16 @@ def _as_existing_source_paths(file_paths: VideoFilesInput) -> list[str]:
 
 def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        output_filename: str, processing_mode: str,
-                       custom_fps: float, session_state: dict,
+                       custom_fps: float, auto_speed_clip_control: bool,
+                       avoid_text_clips: bool,
+                       session_state: dict,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None) -> StatusResult:
     total_started = time.perf_counter()
+    session_state['export_path'] = None
     try:
+        auto_speed_clip_control = True if auto_speed_clip_control is None else bool(auto_speed_clip_control)
+        avoid_text_clips = True if avoid_text_clips is None else bool(avoid_text_clips)
         parallel_workers = PARALLEL_WORKERS
 
         # Initialize session state if needed
@@ -406,12 +456,18 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         set_gpu_mode(use_gpu)
         
         # Determine processing mode
-        is_prores = processing_mode == 'prores_proxy'
-        use_nvenc = (processing_mode in ['h264_nvenc', 'hevc_nvenc']) and NVENC_AVAILABLE
-        gpu_encoder = processing_mode if use_nvenc else 'none'
+        is_prores = processing_mode == 'prores_hq'
+        use_nvenc = processing_mode in NVENC_ENCODERS
+        use_vulkan = processing_mode in VULKAN_ENCODERS
+        if processing_mode in HARDWARE_ENCODERS:
+            support = get_encoder_support(processing_mode)
+            if not support['available']:
+                raise RuntimeError(f"{HARDWARE_ENCODERS[processing_mode]} is unavailable: {support['error']}")
+        use_hardware_encoder = use_nvenc or use_vulkan
+        gpu_encoder = processing_mode if use_hardware_encoder else 'none'
         
         python_str = "Portable" if USING_PORTABLE_PYTHON else "System"
-        cuda_str = "CuPy CTK" if USING_CUPY_CTK else ("Portable" if USING_PORTABLE_CUDA else "System/None")
+        gpu_backend_str = "Taichi Vulkan" if GPU_AVAILABLE else "CPU"
 
         # Determine FPS
         if custom_fps is not None and custom_fps > 0:
@@ -446,25 +502,30 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         result_path = create_music_video(
             local_audio_path, local_video_paths, selected_beats,
             output_file=temp_output, max_workers=parallel_workers,
-            beat_info=beat_info, lossless_mode=is_prores,
-            use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps
+            beat_info=beat_info, export_format='prores_hq' if is_prores else 'auto',
+            use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps,
+            auto_speed_clip_control=bool(auto_speed_clip_control),
+            avoid_text_clips=bool(avoid_text_clips),
         )
 
         # Move to output folder
         shutil.move(result_path, output_path)
+        temp_debug_path = os.path.splitext(result_path)[0] + ".clip_plan_debug.json"
+        output_debug_path = os.path.splitext(output_path)[0] + ".clip_plan_debug.json"
+        if os.path.exists(temp_debug_path):
+            shutil.move(temp_debug_path, output_debug_path)
+            render_info = beat_info.setdefault("render_info", {})
+            render_info["clip_plan_debug"] = output_debug_path
 
-        # Create preview for ProRes if needed
-        preview_path = output_path
-        if is_prores:
-            preview_filename = f"{name}_{timestamp}_preview.mp4"
-            preview_path = os.path.join(session_dir, preview_filename)
-            preview_cmd = [FFMPEG_PATH]
-            if NVENC_AVAILABLE:
-                preview_cmd.extend(['-hwaccel', 'cuda', '-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23'])
-            else:
-                preview_cmd.extend(['-hwaccel', 'auto', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'])
-            preview_cmd.extend(['-i', output_path, '-pix_fmt', 'yuv420p', '-y', preview_path])
-            subprocess.run(preview_cmd, capture_output=True, text=True, timeout=180)
+        session_state['export_path'] = output_path
+        preview_path = os.path.join(session_dir, f"{name}_{timestamp}_preview.mp4")
+        preview_error = None
+        try:
+            create_browser_preview(output_path, preview_path)
+        except Exception as exc:
+            preview_path = None
+            preview_error = str(exc)
+            print(f'Preview failed; the completed export is available: {exc}')
         _stage6_summary(console_logger, beat_info)
 
         # Generate status message based on mode
@@ -473,24 +534,26 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         audio_info = "PCM 24-bit (48kHz)"
         
         if is_prores:
-            codec_info = "ProRes 422 Proxy (.mov) - Lossless"
-            encoder_info = "🎯 Lossless Concatenation"
-        elif use_nvenc:
-            codec_info = f"{gpu_encoder.upper()} (.mp4)"
-            encoder_info = f"⚡ {gpu_encoder.upper()}"
+            codec_info = "ProRes 422 HQ (.mov)"
+            encoder_info = "ProRes 422 HQ"
+        elif use_hardware_encoder:
+            encoder_label = VULKAN_ENCODERS.get(gpu_encoder, gpu_encoder.upper())
+            codec_info = f"{encoder_label} (.mp4)"
+            encoder_info = f"⚡ {encoder_label}"
         else:
             codec_info = "H.264 (.mp4)"
             encoder_info = "💻 libx264"
 
-        total_cuts = len(selected_beats) - 1
+        render_info = beat_info.get("render_info") or {}
+        total_cuts = int(render_info.get("render_cuts") or max(0, len(selected_beats) - 1))
         sections_info = beat_info.get('selection_info', [])
         total_processing_seconds = time.perf_counter() - total_started
-        processing_label = gpu_encoder.upper() if use_nvenc else ("PRORES_PROXY" if is_prores else "H264_CPU")
+        processing_label = gpu_encoder.upper() if use_hardware_encoder else ("PRORES_HQ" if is_prores else "H264_CPU")
         
         status_msg = get_success_message_auto(
             total_cuts, len(beat_times),
             beat_info.get('tempo', 120), sections_info,
-            python_str, cuda_str, MAX_THREADS, CPU_COUNT,
+            python_str, gpu_backend_str, MAX_THREADS, CPU_COUNT,
             parallel_workers, gpu_info, encoder_info,
             codec_info, fps_info, filename, audio_info,
             audio_duration=beat_info.get('audio_duration'),
@@ -498,6 +561,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             total_processing_seconds=total_processing_seconds,
             processing_label=processing_label
         )
+        if preview_error:
+            status_msg += '\nPreview could not be created. The exported video is available to download.'
         # Return preview path for display, keep session_state intact
         return preview_path, status_msg, session_state
 
@@ -510,7 +575,9 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 
 def process_video(audio_file: str, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
-                 custom_fps: float, session_state: dict) -> Iterator[StatusResult]:
+                 custom_fps: float, auto_speed_clip_control: bool,
+                 avoid_text_clips: bool,
+                 session_state: dict) -> Iterator[ExportResult]:
     status_queue: queue.Queue[str | None] = queue.Queue()
     result_queue: queue.Queue[StatusResult] = queue.Queue(maxsize=1)
     initial_status = _stage_status(1)
@@ -532,6 +599,8 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     output_filename=output_filename,
                     processing_mode=processing_mode,
                     custom_fps=custom_fps,
+                    auto_speed_clip_control=auto_speed_clip_control,
+                    avoid_text_clips=avoid_text_clips,
                     session_state=session_state,
                     progress_callback=progress_callback,
                     console_logger=console_logger,
@@ -549,7 +618,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
     thread.start()
 
     last_status = initial_status
-    yield None, initial_status, session_state
+    yield None, initial_status, None, session_state
 
     while True:
         message = status_queue.get()
@@ -557,10 +626,11 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
             break
         if message != last_status:
             last_status = message
-            yield None, message, session_state
+            yield None, message, None, session_state
 
     thread.join()
-    yield result_queue.get()
+    preview, status, state = result_queue.get()
+    yield preview, status, state.get('export_path'), state
 
 
 def cleanup_on_startup():
@@ -601,14 +671,9 @@ def cleanup_on_startup():
 
 def create_ui() -> gr.Blocks:
     # These definitions are needed within the function's scope
-    python_status = "✅ Portable (bin/python-3.13.14-embed-amd64/)" if USING_PORTABLE_PYTHON else "⚠️  System Python"
-    if USING_CUPY_CTK:
-        cuda_status = "✅ CuPy CTK (Python wheel libraries)"
-    elif USING_PORTABLE_CUDA:
-        cuda_status = "✅ Portable (bin/CUDA/v13.3)"
-    else:
-        cuda_status = "⚠️  System CUDA (or not available)"
-    ffmpeg_status = "✅ Portable (bin/ffmpeg/)" if FFMPEG_FOUND else "⚠️  System FFmpeg"
+    python_status = "✅ Portable (bin/python-3.13.17-embed-amd64/)" if USING_PORTABLE_PYTHON else "⚠️  System Python"
+    gpu_backend_status = "✅ Taichi (Vulkan)" if GPU_AVAILABLE else "⚠️ CPU fallback (Vulkan unavailable)"
+    ffmpeg_status = f"✅ FFmpeg {get_runtime_info()['version']} (full)"
     
     app = gr.Blocks(title='BeatSync Engine', theme='ocean', css=STATUS_BOX_CSS)
     with app:
@@ -627,12 +692,36 @@ def create_ui() -> gr.Blocks:
                     gr.Markdown('### ⚙️ Video Settings')
                     custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
 
+                with gr.Accordion('Advanced Settings', open=False):
+                    auto_speed_clip_control = gr.Checkbox(
+                        label='Auto speed clip control',
+                        value=True,
+                        info='Smart slowdowns and speed-ups only when Auto Mode finds a strong reason.'
+                    )
+                    avoid_text_clips = gr.Checkbox(
+                        label='Avoid text',
+                        value=True,
+                        info='Skip source moments with obvious credits, titles, subtitles, captions, UI, or readable text when clean alternatives exist.'
+                    )
+
                 with gr.Group():
                     gr.Markdown(f'### 🎬 Processing Mode')
-                    if NVENC_AVAILABLE:
-                        processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
-                    else:
-                        processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
+                    export_choices = []
+                    for encoder, label in NVENC_ENCODERS.items():
+                        if get_encoder_support(encoder)['available']:
+                            export_choices.append((label, encoder))
+                    vulkan_available = False
+                    for encoder, label in VULKAN_ENCODERS.items():
+                        if get_encoder_support(encoder)['available']:
+                            export_choices.append((label, encoder))
+                            vulkan_available = True
+                    export_choices.extend([('CPU (H.264)', 'cpu'), ('ProRes 422 HQ', 'prores_hq')])
+                    processing_mode = gr.Radio(
+                        choices=export_choices,
+                        value=export_choices[0][1],
+                        label=LABEL_PROCESSING_MODE,
+                        info=get_processing_mode_info(NVENC_AVAILABLE, vulkan_available),
+                    )
                 
                 with gr.Group():
                     gr.Markdown('### 📁 Output Settings')
@@ -642,17 +731,20 @@ def create_ui() -> gr.Blocks:
 
             with gr.Column(scale=1):
                 gr.Markdown('### 📺 Output')
-                status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
+                status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, gpu_backend_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
                 video_output = gr.Video(label='Generated Music Video', interactive=False, elem_id='generated-video-output')
+                export_download = gr.File(label='Download exported video', interactive=False)
                 
         process_btn.click(
             fn=process_video,
             inputs=[
                 audio_input, video_input,
                 output_filename, processing_mode, custom_fps,
+                auto_speed_clip_control,
+                avoid_text_clips,
                 session_state
             ],
-            outputs=[video_output, status_output, session_state],
+            outputs=[video_output, status_output, export_download, session_state],
             show_progress='hidden'
         )
 

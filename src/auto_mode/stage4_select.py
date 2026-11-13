@@ -179,8 +179,22 @@ def compute_cut_scores(beat_indices: np.ndarray, features: Dict, section: Dict,
     wave = features["wave"][idx]
     rhythm = features["rhythm_score"][idx]
     novelty = features["novelty"][idx]
+    beat_confidence = np.asarray(features.get("beat_confidence", np.zeros_like(impact) + 0.5), dtype=float)
+    downbeat_confidence = np.asarray(features.get("downbeat_confidence", np.zeros_like(impact)), dtype=float)
+    if beat_confidence.size != features["impact_score"].size:
+        beat_confidence = np.zeros_like(features["impact_score"], dtype=float) + 0.5
+    if downbeat_confidence.size != features["impact_score"].size:
+        downbeat_confidence = np.zeros_like(features["impact_score"], dtype=float)
 
-    score = 0.36 * impact + 0.27 * rhythm + 0.20 * wave + 0.10 * novelty + 0.07 * features["arc"][idx]
+    score = (
+        0.32 * impact
+        + 0.23 * rhythm
+        + 0.18 * wave
+        + 0.10 * novelty
+        + 0.07 * features["arc"][idx]
+        + 0.06 * beat_confidence[idx]
+        + 0.04 * downbeat_confidence[idx]
+    )
 
     score = score.copy()
     score[features["is_bar_anchor"][idx]] += cfg.anchor_bonus

@@ -6,9 +6,9 @@ $Root = Split-Path -Parent $ScriptDir
 $BinDir = Join-Path $Root "bin"
 $DownloadsDir = Join-Path $BinDir "downloads"
 $UvDir = Join-Path $BinDir "uv"
-$PythonVersion = "3.13.14"
-$FfmpegVersion = "8.1.2"
-$LlamaBuild = "b9842"
+$PythonVersion = "3.13.17"
+$FfmpegVersion = "9.0.2" # Known release when the online latest-version check is unavailable
+$LlamaBuild = "b12360"
 $LlamaDir = Join-Path $BinDir "llama-bin-win-vulkan-x64"
 $PythonDir = Join-Path $BinDir "python-$PythonVersion-embed-amd64"
 $PythonExe = Join-Path $PythonDir "python.exe"
@@ -17,10 +17,9 @@ $ModelsDir = Join-Path $BinDir "models"
 
 $PythonZipUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-embed-amd64.zip"
 $UvZipUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
-$FfmpegZipUrl = "https://github.com/GyanD/codexffmpeg/releases/download/$FfmpegVersion/ffmpeg-$FfmpegVersion-essentials_build.zip"
 $LlamaZipUrl = "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaBuild/llama-$LlamaBuild-bin-win-vulkan-x64.zip"
-$QwenModelUrl = "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3VL-2B-Instruct-Q8_0.gguf?download=true"
-$QwenMmprojUrl = "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-2B-Instruct-F16.gguf?download=true"
+$QwenModelUrl = "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf?download=true"
+$QwenMmprojUrl = "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/mmproj-F16.gguf?download=true"
 
 function Step($Message) {
     Write-Host ""
@@ -211,39 +210,82 @@ function Install-Python {
     Write-Host "Python ready: $PythonExe"
 }
 
+function Get-LatestFFmpegVersion {
+    try {
+        $ReleaseVersion = (Invoke-RestMethod -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z.ver' -TimeoutSec 30).Trim()
+        if ($ReleaseVersion -notmatch '^\d+\.\d+(?:\.\d+)?$') {
+            throw "Unexpected FFmpeg release metadata: $ReleaseVersion"
+        }
+        return $ReleaseVersion
+    } catch {
+        Write-Warning "Could not check the latest FFmpeg release; using known release $FfmpegVersion. $($_.Exception.Message)"
+        return $FfmpegVersion
+    }
+}
+
+function Test-FFmpegFullBuild($Directory, $MinimumVersion) {
+    try {
+        $EncoderExe = Join-Path $Directory 'ffmpeg.exe'
+        $ProbeExe = Join-Path $Directory 'ffprobe.exe'
+        if (-not (Test-Path $EncoderExe) -or -not (Test-Path $ProbeExe)) { return $false }
+        $EncoderVersion = (& $EncoderExe -version 2>$null) -join "`n"
+        $ProbeVersion = (& $ProbeExe -version 2>$null) -join "`n"
+        $EncoderMatch = [regex]::Match($EncoderVersion, '^ffmpeg version ((\d+\.\d+(?:\.\d+)?)-\S+)')
+        $ProbeMatch = [regex]::Match($ProbeVersion, '^ffprobe version (\S+)')
+        if (-not $EncoderMatch.Success -or -not $ProbeMatch.Success) { return $false }
+        if ($EncoderMatch.Groups[1].Value -ne $ProbeMatch.Groups[1].Value) { return $false }
+        if ([version]$EncoderMatch.Groups[2].Value -lt [version]$MinimumVersion) { return $false }
+        if ($EncoderVersion -notmatch '--enable-vulkan' -or $EncoderVersion -notmatch '--enable-libplacebo') { return $false }
+        $EncoderList = (& $EncoderExe -hide_banner -encoders 2>$null) -join "`n"
+        if ($LASTEXITCODE -ne 0) { return $false }
+        foreach ($RequiredEncoder in @('libx264','prores_ks','h264_vulkan','hevc_vulkan','h264_nvenc','hevc_nvenc','pcm_s24le','aac')) {
+            if ($EncoderList -notmatch ("\b" + [regex]::Escape($RequiredEncoder) + "\b")) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
 function Install-FFmpeg {
-    Step "Installing FFmpeg $FfmpegVersion release zip"
-    $FfmpegExe = Join-Path $FfmpegDir "ffmpeg.exe"
-    $FfprobeExe = Join-Path $FfmpegDir "ffprobe.exe"
-    if ((Test-Path $FfmpegExe) -and (Test-Path $FfprobeExe)) {
-        try {
-            $CurrentVersion = (& $FfmpegExe -version 2>$null | Select-Object -First 1)
-            if ($CurrentVersion -match [regex]::Escape($FfmpegVersion)) {
-                Write-Host "FFmpeg ready: $FfmpegDir"
-                return
-            }
-            Write-Host "Existing FFmpeg is not $FfmpegVersion; replacing portable binaries."
-        } catch {
-            Write-Host "Existing FFmpeg version check failed; replacing portable binaries."
+    $ReleaseVersion = Get-LatestFFmpegVersion
+    Step "Checking FFmpeg $ReleaseVersion full build"
+    if (Test-FFmpegFullBuild $FfmpegDir $ReleaseVersion) {
+        Write-Host "Matching FFmpeg/FFprobe full binaries are ready: $FfmpegDir"
+        return
+    }
+    $AssetName = "ffmpeg-$ReleaseVersion-full_build.zip"
+    $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/GyanD/codexffmpeg/releases/tags/$ReleaseVersion" -TimeoutSec 30
+    $Asset = $Release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+    if (-not $Asset) { throw "FFmpeg full ZIP was not found for release $ReleaseVersion." }
+    $Archive = Join-Path $DownloadsDir $AssetName
+    Download-File $Asset.browser_download_url $Archive 1048576
+    $ArchiveHash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($Asset.digest -and $Asset.digest -match '^sha256:(?<checksum>[a-fA-F0-9]{64})$') {
+        if ($ArchiveHash -ne $Matches.checksum.ToLowerInvariant()) {
+            throw "FFmpeg archive checksum mismatch. Remove $Archive and run the installer again."
         }
     }
-
-    Ensure-Dir $FfmpegDir
-    $Archive = Join-Path $DownloadsDir "ffmpeg-$FfmpegVersion-essentials_build.zip"
-    Download-File $FfmpegZipUrl $Archive 1048576
-    $ExtractDir = Join-Path $DownloadsDir "ffmpeg-extract"
+    $ExtractDir = Join-Path $DownloadsDir 'ffmpeg-extract'
     if (Test-Path $ExtractDir) {
+        Assert-InDirectory $ExtractDir $DownloadsDir 'FFmpeg extraction cache'
         Remove-Item -LiteralPath $ExtractDir -Recurse -Force
     }
     Expand-Zip $Archive $ExtractDir
-
-    $ExtractedFfmpeg = Get-ChildItem -Path $ExtractDir -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
-    if (-not $ExtractedFfmpeg) {
-        throw "FFmpeg archive extracted, but ffmpeg.exe was not found."
+    $ExtractedExe = Get-ChildItem -LiteralPath $ExtractDir -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1
+    if (-not $ExtractedExe) { throw 'The FFmpeg archive does not contain ffmpeg.exe.' }
+    $ExtractedBin = Split-Path -Parent $ExtractedExe.FullName
+    if (-not (Test-FFmpegFullBuild $ExtractedBin $ReleaseVersion)) {
+        throw 'The downloaded FFmpeg full build failed version/capability validation.'
     }
-    $ExtractedBin = Split-Path -Parent $ExtractedFfmpeg.FullName
-    Copy-Item -LiteralPath (Join-Path $ExtractedBin "ffmpeg.exe") -Destination $FfmpegDir -Force
-    Copy-Item -LiteralPath (Join-Path $ExtractedBin "ffprobe.exe") -Destination $FfmpegDir -Force
+    Ensure-Dir $FfmpegDir
+    foreach ($Binary in @('ffmpeg.exe','ffprobe.exe','ffplay.exe')) {
+        $SourceBinary = Join-Path $ExtractedBin $Binary
+        if (Test-Path $SourceBinary) { Copy-Item -LiteralPath $SourceBinary -Destination $FfmpegDir -Force }
+    }
+    if (-not (Test-FFmpegFullBuild $FfmpegDir $ReleaseVersion)) {
+        throw 'The installed FFmpeg/FFprobe pair failed validation.'
+    }
+    @{ version = $ReleaseVersion; build = 'full'; source = $Asset.browser_download_url; archive_sha256 = $ArchiveHash } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FfmpegDir 'beatsync-runtime.json') -Encoding UTF8
 }
 
 function Install-LlamaCppVulkan {
@@ -251,10 +293,11 @@ function Install-LlamaCppVulkan {
     $ServerExe = Join-Path $LlamaDir "llama-server.exe"
     $MtmdExe = Join-Path $LlamaDir "llama-mtmd-cli.exe"
     $CliExe = Join-Path $LlamaDir "llama-cli.exe"
+    $ExpectedLlamaBuildNumber = $LlamaBuild -replace '^b', ''
     if ((Test-Path $ServerExe) -and (Test-Path $MtmdExe) -and (Test-Path $CliExe)) {
         try {
             $CurrentVersion = (& $CliExe --version 2>$null | Select-Object -First 1)
-            if ($CurrentVersion -match "version:\s+9842\b") {
+            if ($CurrentVersion -match "(?:version:\s+|build\s+)$([regex]::Escape($ExpectedLlamaBuildNumber))\b") {
                 Write-Host "llama.cpp Vulkan ready: $LlamaDir"
                 return
             }
@@ -288,9 +331,6 @@ function Install-LlamaCppVulkan {
 function Install-PythonPackages($UvExe) {
     Step "Installing Python packages with UV"
     $Env:UV_LINK_MODE = "copy"
-    foreach ($Name in @("CUDA_PATH", "CUDA_HOME", "CUDA_ROOT")) {
-        Remove-Item "Env:$Name" -ErrorAction SilentlyContinue
-    }
     $Env:PATH = @(
         $FfmpegDir,
         $PythonDir,
@@ -306,19 +346,35 @@ function Install-PythonPackages($UvExe) {
 }
 
 function Remove-LegacyPythonPackages($UvExe) {
-    Step "Removing legacy PyTorch/Transformers packages"
-    $Packages = @("torch", "torchvision", "torchaudio", "accelerate", "transformers", "safetensors")
+    Step "Removing superseded Python GPU packages"
+    $Packages = @(
+        "torch", "torchvision", "torchaudio", "accelerate", "transformers", "safetensors",
+        "cupy", "cupy-cuda11x", "cupy-cuda12x", "cupy-cuda13x", "cuda-toolkit", "cuda-pathfinder",
+        "nvidia-cublas", "nvidia-cuda-nvrtc", "nvidia-cuda-runtime", "nvidia-cufft",
+        "nvidia-curand", "nvidia-cusolver", "nvidia-cusparse", "nvidia-nvjitlink"
+    )
     & $UvExe pip uninstall --python $PythonExe --system -y @Packages
     if ($LASTEXITCODE -ne 0) {
-        throw "UV failed while removing legacy PyTorch/Transformers packages."
+        throw "UV failed while removing superseded Python GPU packages."
     }
 }
 
 function Install-QwenGgufModels {
-    Step "Installing Qwen3-VL GGUF models"
+    Step "Installing Qwen3.5 GGUF models (thinking off)"
     Ensure-Dir $ModelsDir
-    Download-File $QwenModelUrl (Join-Path $ModelsDir "Qwen3VL-2B-Instruct-Q8_0.gguf") 104857600
-    Download-File $QwenMmprojUrl (Join-Path $ModelsDir "mmproj-Qwen3VL-2B-Instruct-F16.gguf") 104857600
+    Download-File $QwenModelUrl (Join-Path $ModelsDir "Qwen3.5-2B-Q8_0.gguf") 104857600
+    Download-File $QwenMmprojUrl (Join-Path $ModelsDir "mmproj-F16.gguf") 104857600
+}
+
+function Remove-LegacyQwenModels {
+    Step "Removing superseded Qwen3-VL GGUF models"
+    foreach ($Name in @("Qwen3VL-2B-Instruct-Q8_0.gguf", "mmproj-Qwen3VL-2B-Instruct-F16.gguf")) {
+        $LegacyModel = Join-Path $ModelsDir $Name
+        if (Test-Path -LiteralPath $LegacyModel) {
+            Assert-InDirectory $LegacyModel $ModelsDir "legacy Qwen model"
+            Remove-Item -LiteralPath $LegacyModel -Force
+        }
+    }
 }
 
 function Ensure-AppFolders {
@@ -338,6 +394,9 @@ function Ensure-AppFolders {
 
 function Remove-LegacyFiles {
     Step "Removing legacy runtime files"
+    Get-ChildItem -LiteralPath $BinDir -Directory -Filter "python-*-embed-amd64" -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -ne $PythonDir } |
+        ForEach-Object { Remove-SafeFolder $_.FullName $BinDir "legacy portable Python ($($_.Name))" }
     Remove-SafeFolder (Join-Path $BinDir "PortableGit") $BinDir "PortableGit folder"
     Remove-SafeFolder (Join-Path $BinDir "CUDA\v13.3") $BinDir "portable CUDA Toolkit"
     Remove-SafeFolder (Join-Path $BinDir "models\Qwen3-VL-2B-Instruct") $BinDir "Transformers Qwen model"
@@ -388,21 +447,25 @@ Remove-LegacyPythonPackages $UvExe
 Install-QwenGgufModels
 
 Step "Verifying portable install"
-& $PythonExe -X utf8 -c "import sys, gradio, librosa, cv2, numpy, cupy, numba; print('Python', sys.version.split()[0]); print('gradio', gradio.__version__); print('librosa', librosa.__version__); print('cupy', cupy.__version__); print('numba', numba.__version__); x = cupy.arange(10, dtype=cupy.int32); print('CUDA runtime', cupy.cuda.runtime.runtimeGetVersion()); print('GPU sum', int(cupy.sum(x).get()))"
+& $PythonExe -X utf8 -c "from ffmpeg_runtime import get_runtime_info; r=get_runtime_info(); print('FFmpeg', r['version'], 'full build; matching FFprobe; required encoders verified')"
 if ($LASTEXITCODE -ne 0) {
-    throw "Portable app import/CuPy CTK verification failed."
+    throw "Portable FFmpeg full-build verification failed."
+}
+& $PythonExe -X utf8 -c "import sys, gradio, librosa, cv2, numpy, taichi, numba; from gpu_cpu_utils import GPU_INFO; print('Python', sys.version.split()[0]); print('gradio', gradio.__version__); print('librosa', librosa.__version__); print('Taichi', taichi.__version__); print('numba', numba.__version__); print('GPU analysis', GPU_INFO); print('CPU fallback' if not GPU_INFO['available'] else 'Vulkan compute verified')"
+if ($LASTEXITCODE -ne 0) {
+    throw "Portable app import/Taichi verification failed."
 }
 
-& $PythonExe -X utf8 -c "import importlib.util, sys; missing = [name for name in ('torch', 'torchvision', 'torchaudio', 'accelerate', 'transformers', 'safetensors') if importlib.util.find_spec(name) is not None]; print('legacy packages', missing); sys.exit(1 if missing else 0)"
+& $PythonExe -X utf8 -c "import importlib.util, sys; missing = [name for name in ('torch', 'torchvision', 'torchaudio', 'accelerate', 'transformers', 'safetensors', 'cupy') if importlib.util.find_spec(name) is not None]; print('legacy packages', missing); sys.exit(1 if missing else 0)"
 if ($LASTEXITCODE -ne 0) {
-    throw "Legacy PyTorch/Transformers packages are still installed."
+    throw "Superseded Python GPU packages are still installed."
 }
 
 Test-RequiredFile (Join-Path $LlamaDir "llama-server.exe") "llama-server.exe"
 Test-RequiredFile (Join-Path $LlamaDir "llama-mtmd-cli.exe") "llama-mtmd-cli.exe"
 Test-RequiredFile (Join-Path $LlamaDir "llama-cli.exe") "llama-cli.exe"
-Test-RequiredFile (Join-Path $ModelsDir "Qwen3VL-2B-Instruct-Q8_0.gguf") "Qwen GGUF model"
-Test-RequiredFile (Join-Path $ModelsDir "mmproj-Qwen3VL-2B-Instruct-F16.gguf") "Qwen mmproj model"
+Test-RequiredFile (Join-Path $ModelsDir "Qwen3.5-2B-Q8_0.gguf") "Qwen GGUF model"
+Test-RequiredFile (Join-Path $ModelsDir "mmproj-F16.gguf") "Qwen mmproj model"
 
 & (Join-Path $LlamaDir "llama-cli.exe") --version
 if ($LASTEXITCODE -ne 0) {
@@ -414,7 +477,8 @@ if ($LASTEXITCODE -ne 0) {
     throw "pip check failed."
 }
 
+Remove-LegacyQwenModels
 Cleanup-InstallerFiles
 
 Write-Host ""
-Write-Host "Portable install is ready: llama.cpp Vulkan + CuPy CTK, no PyTorch." -ForegroundColor Green
+Write-Host "Portable install is ready: llama.cpp Vulkan + Taichi Vulkan, no PyTorch." -ForegroundColor Green

@@ -19,6 +19,7 @@ Existing project imports remain compatible:
 import os
 import sys
 import warnings
+import time
 from dataclasses import dataclass
 
 # This package lives at src/auto_mode. Add src to sys.path so shared modules
@@ -181,7 +182,7 @@ def _interp_to_beats(curve: np.ndarray, beat_times: np.ndarray, sr: int, hop_len
 
 from .stage1_audio import detect_master_beat_grid
 from .stage2_features import analyze_wave_features
-from .stage3_sections import analyze_sections
+from .stage3_sections import analyze_sections, refine_musical_anchors
 from .stage4_select import select_wave_cuts
 
 # ---------------------------------------------------------------------------
@@ -245,7 +246,7 @@ def _notify_console(console_callback: Callable[[int, str], None] | None,
 
 
 def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
-                       end_time: float = None, use_gpu: bool = False,
+                       end_time: float = None, use_gpu: bool = True,
                        video_files: List[str] = None,
                        enable_video_analysis: bool = True,
                        enable_qwen_semantics: bool = True,
@@ -277,10 +278,25 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     audio_duration = len(y) / sr
     y = librosa.util.normalize(y)
 
+    separation_started = time.perf_counter()
+    separation_backend = 'CPU'
     try:
-        y_harmonic, y_percussive = librosa.effects.hpss(y)
-    except Exception:
+        if use_gpu and GPU_AVAILABLE:
+            from gpu_cpu_utils import harmonic_percussive_audio
+            print('   GPU audio separation: Taichi Vulkan median filters')
+            try:
+                y_harmonic, y_percussive = harmonic_percussive_audio(y)
+                separation_backend = 'Taichi Vulkan'
+            except Exception as exc:
+                print(f'   GPU audio separation failed; retrying CPU HPSS: {exc}')
+                y_harmonic, y_percussive = librosa.effects.hpss(y)
+        else:
+            y_harmonic, y_percussive = librosa.effects.hpss(y)
+    except Exception as exc:
+        print(f'   Audio separation failed; using the original signal: {exc}')
         y_harmonic, y_percussive = y, y
+        separation_backend = 'Original signal fallback'
+    separation_seconds = time.perf_counter() - separation_started
 
     _notify_progress(progress_callback, 1)
     print("   🥁 Step 1: Detecting stable beat grid...")
@@ -308,6 +324,7 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     _notify_progress(progress_callback, 3)
     print("   🎼 Step 3: Detecting broad musical sections...")
     sections = analyze_sections(y, y_harmonic, y_percussive, sr, beat_times, features, cfg)
+    features = refine_musical_anchors(beat_times, sections, features, cfg)
     print(f"      ✓ {len(sections)} sections")
     section_types = [str(s.get("type", "section")) for s in sections[:5]]
     _notify_console(console_callback, 3, f"Sections: {len(sections)}")
@@ -408,6 +425,11 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         "combined_strength": features["rhythm_score"],
         "impact_strength": features["impact_score"],
         "novelty_strength": features["novelty"],
+        "beat_confidence": features.get("beat_confidence"),
+        "tempo_stability": features.get("tempo_stability"),
+        "downbeat_confidence": features.get("downbeat_confidence"),
+        "bar_phase": features.get("bar_phase"),
+        "bar_phase_confidence": features.get("bar_phase_confidence"),
         "is_strong_kick": features["is_strong_kick"],
         "is_strong_clap": features["is_strong_clap"],
         "is_strong_hihat": features["is_strong_hihat"],
@@ -428,6 +450,8 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         "audio_visual_profile": audio_visual_profile,
         "video_analysis": video_analysis,
         "audio_duration": audio_duration,
+        "audio_separation_backend": separation_backend,
+        "audio_separation_seconds": separation_seconds,
         "mode": "auto_v4_audio_visual_rhythmic_planner",
         "auto_style": "audio_visual_rhythmic_gmv_amv",
     }
@@ -448,7 +472,7 @@ Tuning:
 - Stronger downbeat/bar/phrase synchronization
 - Smooth wave-like density: calm parts hold, big moments cut faster
 - FFmpeg/OpenCV source-video analysis
-- Optional Qwen3-VL semantic tags for action, beauty, emotion, and use-case
+- Optional Qwen3.5 semantic tags for action, beauty, emotion, and use-case
 - Renderer chooses planned source moments instead of random clips
 - Designed for rhythmic, professional GMV/AMV flow
 """

@@ -18,43 +18,45 @@ to automatically generate a video synchronized with your music's rhythm."""
 # ============================================================================
 
 def get_system_performance_info(cpu_count, max_threads, parallel_workers, python_status, 
-                                cuda_status, ffmpeg_status, gpu_status, gpu_device, nvenc_status):
+                                gpu_backend_status, ffmpeg_status, gpu_status, gpu_device, nvenc_status):
     """System performance overview."""
     return f"""## 🚀 System Status
-- **Python**: {python_status} | **CUDA**: {cuda_status}
+- **Python**: {python_status} | **GPU backend**: {gpu_backend_status}
 - **CPU**: {cpu_count} threads | **FFmpeg**: {ffmpeg_status}
 - **GPU**: {gpu_status}{gpu_device} | **NVENC**: {nvenc_status}
 - **Parallel Processing**: {parallel_workers} workers | **Input**: Local project folder"""
 
 PORTABLE_SETUP_INFO = """## 📦 Portable Setup
-Self-contained installation - Python 3.13.14, CUDA 13.3, and FFmpeg included. 
+Self-contained installation - Python 3.13.17, Taichi Vulkan, and FFmpeg included. 
 No system dependencies required."""
 
 GPU_ACCELERATION_INFO = """## ⚡ GPU Acceleration
-- **Audio Analysis**: 5-10x faster with GPU (CuPy + CUDA)
-- **Video Encoding**: 2-3x faster with NVENC hardware encoder
-- **Auto-Detection**: Uses GPU automatically when NVIDIA card detected"""
+- **Audio and Video Analysis**: Taichi Vulkan for audio separation, color conversion and scoring
+- **AI and Export**: Qwen vision/inference and supported decoding, scaling and encoding use the GPU
+- **Auto-Detection**: Automatically selects a discrete GPU"""
 
 NVENC_BENEFITS_INFO = """## 🎬 NVENC Hardware Encoding
-2-3x faster than CPU encoding with comparable quality. Automatically enabled when available."""
+Hardware H.264/H.265 encoding, offered after the GPU driver passes an export probe."""
 
 EXPORT_OPTIONS_INFO = """## 🎬 Export Modes
-- **NVIDIA NVENC H.264**: GPU-accelerated H.264 (fast, .mkv)
-- **NVIDIA NVENC HEVC**: GPU-accelerated H.265 (smaller files, .mkv)
-- **CPU H.264**: Software encoding (.mkv)
-- **ProRes 422 Proxy**: Frame-perfect lossless (.mov)"""
+- **NVIDIA NVENC H.264**: GPU-accelerated H.264 (.mp4)
+- **NVIDIA NVENC HEVC**: GPU-accelerated H.265 (.mp4)
+- **Vulkan Video H.264**: Hardware H.264 encoding (.mp4)
+- **Vulkan Video H.265**: Hardware H.265 encoding (.mp4)
+- **CPU H.264**: Software encoding (.mp4)
+- **ProRes 422 HQ**: High-quality 10-bit 4:2:2 video for editing (.mov)"""
 
-PRORES_MODE_INFO = """## 🎯 ProRes 422 Proxy Mode
-Frame-perfect cuts with zero quality loss. Converts input to ProRes (I-frames only), 
-then uses lossless concatenation. Larger files, perfect accuracy.
+PRORES_MODE_INFO = """## 🎬 ProRes 422 HQ
+High-quality 10-bit 4:2:2 video (I-frames only) for editing workflows.
+ProRes encoding is lossy; stream-copy assembly avoids another encoding pass.
 
 **How it works:**
-1. Converts input videos to ProRes 422 Proxy (all I-frames)
-2. Extracts segments with exact frame counts (frame-perfect)
+1. Selects intervals from the original videos
+2. Encodes those intervals to ProRes 422 HQ with exact frame counts
 3. Concatenates with stream copy (zero quality loss)
 4. Adds music track with PCM audio
 
-**Best for:** Professional editing, archival, maximum quality"""
+**Best for:** High-quality editing handoff"""
 
 # ============================================================================
 # MODE DESCRIPTION
@@ -69,7 +71,7 @@ Fully automatic music + video analysis with rhythmic source matching:
 - ⚡ **Energy Analysis**: High/Medium/Low energy per section
 - 🎯 **Rhythm Pattern Recognition**: Kick/Clap/Bass/Hi-hat patterns
 - 🎬 **Video Moment Analysis**: Motion, quality, scene changes, action/beauty
-- 🧠 **Qwen3-VL Semantic Tags**: Drop/soft/build/action/emotion matching
+- 🧠 **Qwen3.5 Semantic Tags**: Drop/soft/build/action/emotion matching
 - 🎼 **Planned Clip Selection**: Chooses source moments instead of random clips
 
 **How it works:**
@@ -93,16 +95,17 @@ Fully automatic music + video analysis with rhythmic source matching:
 # PERFORMANCE GUIDE
 # ============================================================================
 
-def get_performance_guide(cpu_count, parallel_workers, python_status, cuda_status, 
+def get_performance_guide(cpu_count, parallel_workers, python_status, gpu_backend_status, 
                          ffmpeg_status, gpu_available, gpu_info, nvenc_available):
     """Concise performance guide."""
     
     gpu_text = ""
     if gpu_available:
-        nvenc_text = "NVENC: 2-3x faster encoding" if nvenc_available else ""
+        nvenc_text = "NVENC hardware encoding available" if nvenc_available else "Supported hardware encoders appear in Export Format"
         gpu_text = f"""**GPU Acceleration** ({gpu_info}):
-- Audio analysis: 5-10x faster
+- Audio separation, video scoring and Qwen inference use the selected dGPU
 - {nvenc_text}
+- Performance depends on the source codec, GPU and export format
 
 """
     
@@ -110,38 +113,34 @@ def get_performance_guide(cpu_count, parallel_workers, python_status, cuda_statu
 
 **Portable Components**:
 - Python: {python_status}
-- CUDA: {cuda_status}
+- GPU backend: {gpu_backend_status}
 - FFmpeg: {ffmpeg_status}
 
 {gpu_text}**Processing Modes**:
-- **NVENC H.264**: GPU-accelerated (fastest)
-- **NVENC HEVC**: GPU-accelerated (smaller files)
+- **NVENC H.264**: Hardware H.264 encoding
+- **NVENC HEVC**: Hardware H.265 encoding
+- **Vulkan Video H.264 / H.265**: Hardware encoding on a compatible Vulkan Video GPU
 - **CPU H.264**: Software encoding
-- **ProRes 422 Proxy**: Lossless (converts to ProRes, then concatenates)
+- **ProRes 422 HQ**: High-quality 10-bit 4:2:2 export; GPU encoding when supported
 
 **Temp Files**: `./temp/` folder (local only, auto-cleaned)
 
 **FPS**: Leave empty to auto-detect from input video, or set custom (24/30/60)
 
-**Speed Estimates** (3-min video):
-- CPU only: ~2-3 min
-- GPU + NVENC: ~45-90 sec ⚡
-- ProRes: ~3-5 min (conversion) + instant (concat)
-
-**RAM Usage**: Constant with FFmpeg (no batch processing needed)
+**Processing Time**: Depends on the full source-video lengths, AI scene budget and export format.
+Cached source analysis reduces work on repeat runs. ProRes HQ encodes only selected clips.
 
 **Parallel Workers**:
-- More workers = faster processing
 - Recommended: {parallel_workers} (auto-calculated from CPU)
-- With NVENC: Can use more workers (GPU handles encoding)"""
+- Hardware exports cap simultaneous jobs to avoid overloading the GPU"""
 
 # ============================================================================
 # GUIDES
 # ============================================================================
 
 NVENC_GUIDE_ACTIVE = """**🚀 NVENC Auto-Enabled!**
-GPU hardware encoding: 2-3x faster than CPU.
-Select NVIDIA NVENC H.264 or HEVC for best performance.
+Hardware encoding is available on the selected dGPU.
+Select NVIDIA NVENC H.264 or HEVC for GPU export.
 
 ---
 
@@ -154,8 +153,8 @@ QUICK_START_GUIDE = """### 💡 Quick Start
 2. Click "Create Music Video"
 3. Done! Automatic audio-visual cuts
 
-**🎯 Lossless (ProRes):**
-- Select **ProRes 422 Proxy** mode for frame-perfect quality
+**🎬 ProRes Export:**
+- Select **ProRes 422 HQ** for high-quality editing handoff
 
 ---
 
@@ -165,19 +164,19 @@ QUICK_START_GUIDE = """### 💡 Quick Start
 # SYSTEM INFO PANEL
 # ============================================================================
 
-def get_system_info_panel(python_status, cuda_status, cpu_count, max_threads, 
+def get_system_info_panel(python_status, gpu_backend_status, cpu_count, max_threads, 
                          ffmpeg_status, gpu_status, gpu_device, nvenc_status, 
                          librosa_version):
     """Compact system info."""
     return f"""**System:**
-Python: {python_status} | CUDA: {cuda_status}
+Python: {python_status} | GPU backend: {gpu_backend_status}
 CPU: {cpu_count} cores ({max_threads} threads)
 FFmpeg: {ffmpeg_status} | Librosa: {librosa_version}
 GPU: {gpu_status}{gpu_device} | NVENC: {nvenc_status}
 
 **Files:**
-- Python: `bin/python-3.13.14-embed-amd64/`
-- CUDA: `bin/CUDA/v13.3/`
+- Python: `bin/python-3.13.17-embed-amd64/`
+- GPU backend: Taichi with the Vulkan driver
 - FFmpeg: `bin/ffmpeg/ffmpeg.exe`
 - Temp: `./temp/` (local only)
 - Output: `./output/`
@@ -189,7 +188,7 @@ GPU: {gpu_status}{gpu_device} | NVENC: {nvenc_status}
 # STATUS MESSAGES
 # ============================================================================
 
-def get_ready_status(python_status, cuda_status, max_threads, cpu_count, ffmpeg_status,
+def get_ready_status(python_status, gpu_backend_status, max_threads, cpu_count, ffmpeg_status,
                     gpu_available, gpu_info, nvenc_available):
     """Ready status message."""
     return '✅ Ready to process!\n\nUpload audio and video files to begin.'
@@ -251,7 +250,7 @@ def _format_auto_section_summary(sections_info):
 
 
 def get_success_message_auto(total_cuts, total_beats, tempo, sections_info,
-                            python_str, cuda_str, max_threads, cpu_count,
+                            python_str, gpu_backend_str, max_threads, cpu_count,
                             parallel_workers, gpu_info, encoder_info,
                             codec_info, fps_info, filename, audio_info,
                             audio_duration=None, output_fps=None,
@@ -296,7 +295,7 @@ Output: {filename}"""
 CONSOLE_SEPARATOR = "=" * 70
 
 def get_startup_header(cpu_count, max_threads, parallel_workers, python_status, 
-                      cuda_status, librosa_version, ffmpeg_status, gpu_available, 
+                      gpu_backend_status, librosa_version, ffmpeg_status, gpu_available, 
                       gpu_info, nvenc_available):
     """Startup header."""
     gpu_line = f"   GPU: {gpu_info} (Auto-enabled)" if gpu_available else "   GPU: Not available (CPU only)"
@@ -306,7 +305,7 @@ def get_startup_header(cpu_count, max_threads, parallel_workers, python_status,
 🎵 BeatSync Engine
 {CONSOLE_SEPARATOR}
    Python: {python_status}
-   CUDA: {cuda_status}
+   GPU backend: {gpu_backend_status}
    FFmpeg: {ffmpeg_status}
    Librosa: {librosa_version}
    CPU: {cpu_count} threads ({max_threads} max per encode)
@@ -314,7 +313,7 @@ def get_startup_header(cpu_count, max_threads, parallel_workers, python_status,
    {gpu_line}
    {nvenc_line}
    Mode: 🤖 Auto
-   ProRes 422 Proxy: ENABLED"""
+   ProRes 422 HQ: ENABLED"""
 
 # ============================================================================
 # INPUT LABELS & INFO
@@ -337,7 +336,7 @@ INFO_PARALLEL_WORKERS = "Clips processed simultaneously. More workers with GPU."
 
 # Output
 LABEL_OUTPUT_FILENAME = "📝 Output Filename"
-INFO_OUTPUT_FILENAME = "Timestamp added automatically (.mkv or .mov)"
+INFO_OUTPUT_FILENAME = "Timestamp added automatically (.mp4 or .mov)"
 
 def get_gpu_status_info(gpu_available, gpu_info, nvenc_available):
     """GPU status info."""
@@ -350,11 +349,21 @@ def get_gpu_status_info(gpu_available, gpu_info, nvenc_available):
 
 def get_processing_mode_info_nvenc():
     """Processing mode info with NVENC."""
-    return 'GPU (NVENC): High quality | CPU: High quality | ProRes: Max quality'
+    return 'GPU (NVENC): High quality | CPU: High quality | ProRes: 422 HQ'
 
 def get_processing_mode_info_cpu():
     """Processing mode info without NVENC."""
-    return 'CPU: H.264 encoding | ProRes: Max quality (NVENC not available)'
+    return 'CPU: H.264 encoding | ProRes: 422 HQ (NVENC not available)'
+
+
+def get_processing_mode_info(nvenc_available, vulkan_available):
+    hardware = []
+    if nvenc_available:
+        hardware.append('NVENC')
+    if vulkan_available:
+        hardware.append('Vulkan Video')
+    prefix = f"Hardware encoding: {' / '.join(hardware)} | " if hardware else ''
+    return prefix + 'CPU: H.264 | ProRes: 422 HQ'
 
 def get_parallel_workers_label(recommended_workers):
     """Parallel workers label."""

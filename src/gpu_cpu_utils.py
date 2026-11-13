@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-"""Shared CPU, GPU, CuPy, and NVENC helpers."""
+"""Shared CPU, Taichi Vulkan, and NVENC helpers."""
 
 import multiprocessing
-import os
-
-import numpy as np
-
 from logger import get_gpu_info, check_nvenc, setup_environment
 
 
@@ -30,21 +26,16 @@ def get_parallel_workers() -> int:
 
 
 setup_environment()
-os.environ.setdefault('CUPY_ACCELERATORS', 'cub')
 GPU_INFO = get_gpu_info()
 GPU_AVAILABLE = GPU_INFO['available']
 
 if GPU_AVAILABLE:
-    try:
-        import cupy as cp
-    except ImportError:
-        cp = None
-        GPU_AVAILABLE = False
+    import taichi_backend as GPU_BACKEND
 else:
-    cp = None
+    GPU_BACKEND = None
 
 NVENC_AVAILABLE = check_nvenc()
-USE_GPU = False
+USE_GPU = GPU_AVAILABLE
 
 
 def is_gpu_enabled() -> bool:
@@ -56,53 +47,43 @@ def set_gpu_mode(enabled: bool) -> bool:
     """Enable or disable GPU acceleration."""
     global USE_GPU
     if enabled and not GPU_AVAILABLE:
-        print("⚠️  GPU requested but CuPy not available, falling back to CPU")
+        print("⚠️  Taichi Vulkan is unavailable, falling back to CPU")
         USE_GPU = False
         return False
 
     USE_GPU = enabled
     if enabled:
-        cuda_str = GPU_INFO.get('backend', 'System CUDA')
-        print(f"🚀 GPU acceleration ENABLED (using {cuda_str})")
+        print(f"🚀 GPU acceleration ENABLED (using {GPU_INFO['backend']})")
     else:
         print(f"💻 Using CPU mode")
 
     return USE_GPU
 
 
-def get_array_module(use_gpu: bool = None):
-    """Get NumPy or CuPy based on GPU setting."""
-    if use_gpu is None:
-        use_gpu = USE_GPU
-    return cp if (use_gpu and GPU_AVAILABLE) else np
+def rhythm_band_sums(stft, frequencies):
+    if GPU_BACKEND is None:
+        raise RuntimeError("Taichi Vulkan is unavailable")
+    return GPU_BACKEND.rhythm_band_sums(stft, frequencies)
 
 
-def to_cpu(array):
-    """Convert a CuPy array to a NumPy array if needed."""
-    if GPU_AVAILABLE and cp is not None and isinstance(array, cp.ndarray):
-        return cp.asnumpy(array)
-    return array
+def frame_statistics(frames):
+    if GPU_BACKEND is None:
+        raise RuntimeError("Taichi Vulkan is unavailable")
+    return GPU_BACKEND.frame_statistics(frames)
 
 
-def to_gpu(array, use_gpu: bool = None):
-    """Convert a NumPy array to a CuPy array if GPU mode is enabled."""
-    if use_gpu is None:
-        use_gpu = USE_GPU
-    if use_gpu and GPU_AVAILABLE and cp is not None and isinstance(array, np.ndarray):
-        return cp.asarray(array)
-    return array
+def harmonic_percussive_audio(y):
+    if GPU_BACKEND is None:
+        raise RuntimeError('Taichi Vulkan is unavailable')
+    return GPU_BACKEND.harmonic_percussive_audio(y)
 
 
 def clear_gpu_memory() -> None:
-    """Synchronize GPU work while keeping CuPy's memory pool warm."""
-    if GPU_AVAILABLE and cp is not None:
-        cp.cuda.Stream.null.synchronize()
-        if os.environ.get('BEATSYNC_RELEASE_GPU_MEMORY') == '1':
-            release_gpu_memory()
+    """Finish Vulkan work; per-call array buffers are released by Taichi."""
+    if GPU_BACKEND is not None:
+        GPU_BACKEND.synchronize()
 
 
 def release_gpu_memory() -> None:
-    """Release cached CuPy memory blocks back to the driver."""
-    if GPU_AVAILABLE and cp is not None:
-        cp.get_default_memory_pool().free_all_blocks()
-        cp.get_default_pinned_memory_pool().free_all_blocks()
+    """Finish work before releasing application-owned array references."""
+    clear_gpu_memory()

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 import os
 import sys
-import subprocess
 import librosa
 from typing import Dict
-from importlib import metadata
+from ffmpeg_runtime import FFMPEG_BIN_DIR, FFMPEG_EXE, FFPROBE_EXE, get_runtime_info
 
 # ============================================================================
 # PATHS & DIRECTORIES
@@ -17,42 +16,8 @@ ROOT_DIR = os.path.dirname(SRC_DIR)
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-PORTABLE_CUDA_DIR = os.path.join(ROOT_DIR, 'bin', 'CUDA', 'v13.3')
-PORTABLE_PYTHON_DIR = os.path.join(ROOT_DIR, 'bin', 'python-3.13.14-embed-amd64')
-FFMPEG_BIN_DIR = os.path.join(ROOT_DIR, 'bin', 'ffmpeg')
-FFMPEG_EXE = os.path.join(FFMPEG_BIN_DIR, 'ffmpeg.exe')
+PORTABLE_PYTHON_DIR = os.path.join(ROOT_DIR, 'bin', 'python-3.13.17-embed-amd64')
 
-def _package_installed(name: str) -> bool:
-    try:
-        metadata.version(name)
-        return True
-    except metadata.PackageNotFoundError:
-        return False
-
-
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, '').strip().lower() in {'1', 'true', 'yes', 'on'}
-
-
-def _is_same_or_child_path(path: str, parent: str) -> bool:
-    try:
-        norm_path = os.path.normcase(os.path.abspath(path))
-        norm_parent = os.path.normcase(os.path.abspath(parent))
-        return norm_path == norm_parent or norm_path.startswith(norm_parent + os.sep)
-    except Exception:
-        return False
-
-
-def _strip_path_prefix(path_value: str, prefix: str) -> str:
-    parts = []
-    for entry in path_value.split(os.pathsep):
-        if entry and not _is_same_or_child_path(entry, prefix):
-            parts.append(entry)
-    return os.pathsep.join(parts)
-
-
-USING_CUPY_CTK = _package_installed('cuda-toolkit') and not _env_truthy('BEATSYNC_FORCE_PORTABLE_CUDA')
-USING_PORTABLE_CUDA = os.path.exists(PORTABLE_CUDA_DIR) and not USING_CUPY_CTK
 USING_PORTABLE_PYTHON = os.path.exists(PORTABLE_PYTHON_DIR)
 FFMPEG_FOUND = os.path.exists(FFMPEG_EXE)
 
@@ -61,34 +26,9 @@ FFMPEG_FOUND = os.path.exists(FFMPEG_EXE)
 # ============================================================================
 
 def setup_environment():
-    """Configure portable environment variables for CUDA and Python."""
-    # CUDA Setup
-    if USING_CUPY_CTK:
-        for key in ('CUDA_PATH', 'CUDA_HOME', 'CUDA_ROOT'):
-            os.environ.pop(key, None)
-        os.environ['PATH'] = _strip_path_prefix(os.environ.get('PATH', ''), PORTABLE_CUDA_DIR)
-        if 'LD_LIBRARY_PATH' in os.environ:
-            os.environ['LD_LIBRARY_PATH'] = _strip_path_prefix(os.environ.get('LD_LIBRARY_PATH', ''), PORTABLE_CUDA_DIR)
-    elif USING_PORTABLE_CUDA:
-        os.environ['CUDA_PATH'] = PORTABLE_CUDA_DIR
-        os.environ['CUDA_HOME'] = PORTABLE_CUDA_DIR
-        os.environ['CUDA_ROOT'] = PORTABLE_CUDA_DIR
-        
-        cuda_bin = os.path.join(PORTABLE_CUDA_DIR, 'bin', 'x64')
-        cuda_lib = os.path.join(PORTABLE_CUDA_DIR, 'lib', 'x64')
-        
-        # Add to PATH for DLL and Library discovery
-        current_path = os.environ.get('PATH', '')
-        for p in [cuda_bin, cuda_lib]:
-            if os.path.exists(p) and p not in current_path:
-                os.environ['PATH'] = p + os.pathsep + os.environ.get('PATH', '')
-                
-        # Linux compatibility (doesn't hurt on Windows)
-        if 'LD_LIBRARY_PATH' in os.environ:
-            os.environ['LD_LIBRARY_PATH'] = cuda_lib + os.pathsep + os.environ.get('LD_LIBRARY_PATH', '')
-        else:
-            os.environ['LD_LIBRARY_PATH'] = cuda_lib
-    
+    """Configure the portable Python environment."""
+    if FFMPEG_BIN_DIR not in os.environ.get('PATH', '').split(os.pathsep):
+        os.environ['PATH'] = FFMPEG_BIN_DIR + os.pathsep + os.environ.get('PATH', '')
     # Python Setup
     if USING_PORTABLE_PYTHON:
         if PORTABLE_PYTHON_DIR not in os.environ.get('PATH', ''):
@@ -105,38 +45,20 @@ def setup_environment():
             pass
 
 def get_gpu_info() -> Dict:
-    """Detect GPU hardware and CUDA runtime details via CuPy."""
-    info = {
-        'available': False,
-        'name': 'No GPU',
-        'cuda_version': 'None',
-        'is_portable': USING_PORTABLE_CUDA,
-        'backend': 'CuPy CTK' if USING_CUPY_CTK else ('Portable CUDA' if USING_PORTABLE_CUDA else 'System CUDA')
-    }
-    
+    """Detect a verified Taichi Vulkan compute device, with CPU fallback."""
     try:
-        import cupy as cp
-        info['available'] = True
-        device = cp.cuda.Device()
-        props = cp.cuda.runtime.getDeviceProperties(device.id)
-        info['name'] = props['name'].decode('utf-8')
-        
-        v = cp.cuda.runtime.runtimeGetVersion()
-        # Format as Major.Minor (e.g., 13000 -> 13.0)
-        info['cuda_version'] = f"{v // 1000}.{(v % 1000) // 10}"
-    except ImportError:
-        pass
-    except Exception:
-        info['name'] = 'Available (Detection Failed)'
-        
-    return info
+        from taichi_backend import get_backend_info
+        return get_backend_info()
+    except Exception as exc:
+        return {'available': False, 'name': 'No Vulkan GPU', 'backend': 'Taichi Vulkan',
+                'vulkan_version': 'None', 'error': str(exc)}
+
 
 def check_nvenc() -> bool:
-    """Check if FFmpeg supports NVIDIA hardware encoding (NVENC)."""
+    """Verify that the driver can encode with NVENC on this machine."""
     try:
-        cmd = [FFMPEG_EXE if FFMPEG_FOUND else 'ffmpeg', '-encoders']
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        return 'h264_nvenc' in result.stdout
+        from video_encoders import get_encoder_support
+        return get_encoder_support('h264_nvenc')['available']
     except Exception:
         return False
 
@@ -151,6 +73,8 @@ def print_startup_banner():
     from gpu_cpu_utils import CPU_COUNT
 
     gpu = get_gpu_info()
+    from gpu_devices import get_discrete_gpu
+    selected = get_discrete_gpu()
     nvenc = check_nvenc()
     cpu_count = CPU_COUNT
     
@@ -160,16 +84,16 @@ def print_startup_banner():
     
     python_type = "Portable" if USING_PORTABLE_PYTHON else "System"
     print(f"   Python: {python_type} ({sys.version.split()[0]})")
+    print(f"   Selected dGPU: {selected['name']}" + (f" (Vulkan device {selected['index']})" if selected['available'] else ''))
     
-    cuda_type = gpu.get('backend', "Portable CUDA" if gpu['is_portable'] else "System CUDA")
     if gpu['available']:
-        print(f"   CUDA: {cuda_type} | Runtime: {gpu['cuda_version']}")
+        print(f"   GPU analysis: {gpu['backend']} | Vulkan: {gpu['vulkan_version']}")
         print(f"   GPU: {gpu['name']}")
     else:
-        print(f"   CUDA: {cuda_type} | GPU: Not available (CPU only)")
-        
-    ffmpeg_type = "Portable" if FFMPEG_FOUND else "System"
-    print(f"   FFmpeg: {ffmpeg_type} | NVENC: {'[OK]' if nvenc else '[NO]'}")
+        print(f"   GPU analysis: CPU ({gpu.get('error', 'Vulkan unavailable')})")
+
+    runtime = get_runtime_info()
+    print(f"   FFmpeg: {runtime['version']} (portable full build) | NVENC: {'[OK]' if nvenc else '[NO]'}")
     print(f"   CPU Optimization: {cpu_count} threads detected")
     print(f"   Librosa: {librosa.__version__}")
     print(CONSOLE_SEPARATOR + "\n")

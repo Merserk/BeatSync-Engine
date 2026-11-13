@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Standalone Qwen3-VL semantic tagging worker via llama.cpp Vulkan.
+"""Standalone Qwen3.5 semantic tagging worker via llama.cpp Vulkan.
 
 The main app keeps Auto Mode's candidate selection and merge behavior outside
 this worker. This process samples the same candidate frames and tags them with
-the bundled Qwen3-VL GGUF model through llama.cpp. It prefers a persistent
+the bundled Qwen3.5 GGUF model through llama.cpp. It prefers a persistent
 llama-server process so the model loads once, and falls back to llama-mtmd-cli
 when the server path is unavailable.
 """
@@ -29,13 +29,25 @@ from typing import Any, Dict, List, Tuple
 import cv2
 import numpy as np
 from PIL import Image
+from gpu_devices import get_discrete_gpu, llama_gpu_environment
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 BIN_DIR = ROOT_DIR / "bin"
 DEFAULT_LLAMA_DIR = BIN_DIR / "llama-bin-win-vulkan-x64"
-DEFAULT_MODEL = BIN_DIR / "models" / "Qwen3VL-2B-Instruct-Q8_0.gguf"
-DEFAULT_MMPROJ = BIN_DIR / "models" / "mmproj-Qwen3VL-2B-Instruct-F16.gguf"
+DEFAULT_MODEL = BIN_DIR / "models" / "Qwen3.5-2B-Q8_0.gguf"
+DEFAULT_MMPROJ = BIN_DIR / "models" / "mmproj-F16.gguf"
+MODEL_ALIAS = "qwen3.5"
+# llama-mtmd-cli does not expose the server's thinking controls. Use Qwen's
+# ChatML framing with an empty, closed thinking block for this single-turn path.
+NON_THINKING_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"
+    "{{ '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}"
+    "{% endif %}"
+)
 
 NUMERIC_KEYS = [
     "action_intensity",
@@ -55,13 +67,14 @@ SEMANTIC_SCHEMA = {
         key: {"type": "number", "minimum": 0, "maximum": 1}
         for key in NUMERIC_KEYS
     },
-    "required": NUMERIC_KEYS + ["emotion", "recommended_use", "description"],
+    "required": NUMERIC_KEYS + ["emotion", "recommended_use", "description", "visible_text"],
     "additionalProperties": False,
 }
 SEMANTIC_SCHEMA["properties"].update({
     "emotion": {"type": "string", "enum": sorted(ALLOWED_EMOTIONS)},
     "recommended_use": {"type": "string", "enum": sorted(ALLOWED_USES)},
     "description": {"type": "string"},
+    "visible_text": {"type": "boolean"},
 })
 
 
@@ -105,11 +118,11 @@ def _parse_json_object(text: str) -> Dict:
 
 
 def _qwen_frame_width() -> int:
-    return _env_int("BEATSYNC_QWEN_FRAME_WIDTH", 512, lo=224, hi=768)
+    return _env_int("BEATSYNC_QWEN_FRAME_WIDTH", 768, lo=224, hi=768)
 
 
 def _max_new_tokens() -> int:
-    return _env_int("BEATSYNC_QWEN_MAX_NEW_TOKENS", 128, lo=32, hi=256)
+    return _env_int("BEATSYNC_QWEN_MAX_NEW_TOKENS", 256, lo=32, hi=256)
 
 
 def _ctx_sizes() -> List[int]:
@@ -126,7 +139,7 @@ def _llama_slots() -> int:
     return _env_int("BEATSYNC_QWEN_LLAMA_SLOTS", 16, lo=1, hi=32)
 
 
-def _resize_frame(frame, max_width: int = 512):
+def _resize_frame(frame, max_width: int = 768):
     h, w = frame.shape[:2]
     if w <= max_width:
         return frame
@@ -261,6 +274,7 @@ def _normalize_semantic(data: Dict) -> Dict:
     out["emotion"] = emotion
     out["recommended_use"] = recommended_use
     out["description"] = description[:160]
+    out["visible_text"] = bool(data.get("visible_text"))
     return out
 
 
@@ -273,10 +287,13 @@ def _build_prompt(audio_profile: Dict) -> str:
     return (
         "You are tagging one source-video moment for professional AMV/GMV editing. "
         f"The music edit style is {style_hint}. "
+        "Judge only what is clearly visible in this frame: subject clarity, action type, "
+        "camera movement, and whether the moment is a true highlight or just filler. "
         "Return JSON only. Keys: action_intensity, beauty_score, combat, chase, explosion, "
         "character_focus, camera_motion, visual_quality as numbers 0..1; "
         "emotion as one of soft,tension,hype,sad,neutral; "
         "recommended_use as one of drop,soft,build,transition,flow,filler; "
+        "visible_text true only for clear credits, titles, subtitles, captions, UI, or readable text; "
         "description under 12 words. Do not include markdown."
     )
 
@@ -386,7 +403,7 @@ class LlamaPaths:
 
 
 def _llama_env(paths: LlamaPaths) -> Dict[str, str]:
-    env = os.environ.copy()
+    env = llama_gpu_environment()
     path_parts = [str(paths.llama_dir)]
     for part in env.get("PATH", "").split(os.pathsep):
         if part and os.path.normcase(os.path.abspath(part)) != os.path.normcase(str(paths.llama_dir)):
@@ -398,6 +415,7 @@ def _llama_env(paths: LlamaPaths) -> Dict[str, str]:
 
 
 def _parse_devices(text: str) -> List[Dict[str, Any]]:
+    """Read reported backend IDs; GPU type comes from Vulkan driver properties."""
     devices = []
     pattern = re.compile(r"^\s*(Vulkan\d+):\s*(.+?)\s*\((\d+)\s+MiB,\s*(\d+)\s+MiB free\)", re.I)
     for line in text.splitlines():
@@ -405,30 +423,11 @@ def _parse_devices(text: str) -> List[Dict[str, Any]]:
         if not match:
             continue
         name = match.group(2).strip()
-        lower = name.lower()
-        integrated = any(token in lower for token in [
-            "radeon(tm) graphics",
-            "integrated",
-            "uhd",
-            "iris",
-            "vega",
-        ])
-        discrete = any(token in lower for token in [
-            "nvidia",
-            "geforce",
-            "rtx",
-            "gtx",
-            "quadro",
-            "radeon rx",
-            "arc",
-        ]) and not integrated
         devices.append({
             "id": match.group(1),
             "name": name,
             "total_mib": int(match.group(3)),
             "free_mib": int(match.group(4)),
-            "discrete": discrete,
-            "integrated": integrated,
         })
     return devices
 
@@ -449,43 +448,14 @@ def _adaptive_llama_slots(device: Dict[str, Any] | None = None) -> int:
 
 
 def _select_vulkan_device(paths: LlamaPaths) -> Tuple[str | None, str]:
-    override = os.environ.get("BEATSYNC_QWEN_LLAMA_DEVICE", "").strip()
-    if override:
-        if override.lower() in {"none", "cpu"}:
-            return None, "CPU/no Vulkan override"
-        return override, f"{override} (env override)"
-
-    try:
-        result = subprocess.run(
-            [str(paths.list_exe), "--list-devices"],
-            cwd=str(paths.llama_dir),
-            env=_llama_env(paths),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=20,
-            check=False,
-        )
-    except Exception as exc:
-        return None, f"device list unavailable: {exc}"
-
-    devices = _parse_devices((result.stdout or "") + "\n" + (result.stderr or ""))
-    if not devices:
-        return None, "no Vulkan devices reported"
-
-    discrete = [device for device in devices if device["discrete"]]
-    pool = discrete or devices
-    selected = max(pool, key=lambda item: (item["free_mib"], item["total_mib"]))
-    return selected["id"], f"{selected['id']}: {selected['name']}"
+    device, label, _ = _select_vulkan_device_info(paths)
+    return device, label
 
 
 def _select_vulkan_device_info(paths: LlamaPaths) -> Tuple[str | None, str, Dict[str, Any] | None]:
-    override = os.environ.get("BEATSYNC_QWEN_LLAMA_DEVICE", "").strip()
-    if override:
-        if override.lower() in {"none", "cpu"}:
-            return None, "CPU/no Vulkan override", None
-        return override, f"{override} (env override)", None
+    selected = get_discrete_gpu()
+    if not selected['available']:
+        return None, f"CPU: {selected['error']}", None
 
     try:
         result = subprocess.run(
@@ -498,18 +468,31 @@ def _select_vulkan_device_info(paths: LlamaPaths) -> Tuple[str | None, str, Dict
             errors="replace",
             timeout=20,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception as exc:
-        return None, f"device list unavailable: {exc}", None
+        return None, f"CPU: selected dGPU unavailable to llama.cpp: {exc}", None
 
     devices = _parse_devices((result.stdout or "") + "\n" + (result.stderr or ""))
-    if not devices:
-        return None, "no Vulkan devices reported", None
+    if result.returncode or len(devices) != 1 or devices[0]['name'].casefold() != selected['name'].casefold():
+        return None, f"CPU: llama.cpp could not expose only the selected dGPU ({selected['name']})", None
+    device = devices[0]
+    device['discrete'] = True
+    device['integrated'] = False
+    device['physical_index'] = selected['index']
+    return device['id'], f"{device['id']}: {selected['name']} (discrete GPU)", device
 
-    discrete = [device for device in devices if device["discrete"]]
-    pool = discrete or devices
-    selected = max(pool, key=lambda item: (item["free_mib"], item["total_mib"]))
-    return selected["id"], f"{selected['id']}: {selected['name']}", selected
+
+def _llama_device_args(device: str | None) -> List[str]:
+    if device:
+        # device is discovered by --list-devices after restricting visibility
+        # to the physical dGPU. main-gpu=0 addresses this one-device model
+        # list, not the machine's physical GPU at index zero.
+        return ['--device', device, '--mmproj-device', device, '--gpu-layers', 'all',
+                '--split-mode', 'none', '--main-gpu', '0', '--mmproj-offload']
+    # Never leave an unspecified device or automatic offload on a CPU fallback.
+    return ['--device', 'none', '--mmproj-device', 'none', '--gpu-layers', '0',
+            '--split-mode', 'none', '--main-gpu', '0', '--no-mmproj-offload']
 
 
 def _free_tcp_port() -> int:
@@ -554,7 +537,11 @@ class LlamaServerClient:
         self._stderr_handle = self.stderr_path.open("w", encoding="utf-8", errors="replace")
         self.process: subprocess.Popen | None = None
         self.load_seconds = 0.0
-        self._start()
+        try:
+            self._start()
+        except Exception:
+            self.close()
+            raise
 
     def _start(self) -> None:
         args = [
@@ -566,19 +553,18 @@ class LlamaServerClient:
             "--ctx-size", str(self.ctx_size),
             "--batch-size", "2048",
             "--ubatch-size", "512",
-            "--gpu-layers", "all",
-            "--split-mode", "none",
             "--parallel", str(self.slots),
             "--cont-batching",
             "--timeout", "3600",
-            "--mmproj-offload",
+            "--jinja",
             "--reasoning", "off",
-            "--alias", "qwen3vl",
+            "--reasoning-budget", "0",
+            "--chat-template-kwargs", '{"enable_thinking":false}',
+            "--alias", MODEL_ALIAS,
             "--log-verbosity", "1",
             "--no-log-prefix",
         ]
-        if self.device:
-            args.extend(["--device", self.device])
+        args.extend(_llama_device_args(self.device))
 
         started = time.perf_counter()
         self.process = subprocess.Popen(
@@ -628,7 +614,9 @@ class LlamaServerClient:
             raise RuntimeError("llama-server is not running")
         timeout = float(_env_int("BEATSYNC_QWEN_LLAMA_HTTP_TIMEOUT", 240, lo=30, hi=1800))
         payload = {
-            "model": "qwen3vl",
+            "model": MODEL_ALIAS,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "reasoning_effort": "none",
             "messages": [{
                 "role": "user",
                 "content": [
@@ -697,9 +685,8 @@ class LlamaMtmdClient:
             "--ctx-size", str(self.ctx_size),
             "--batch-size", "2048",
             "--ubatch-size", "512",
-            "--gpu-layers", "all",
-            "--split-mode", "none",
-            "--mmproj-offload",
+            "--jinja",
+            "--chat-template", NON_THINKING_CHAT_TEMPLATE,
             "--temp", "0",
             "--top-k", "1",
             "--top-p", "1",
@@ -709,8 +696,7 @@ class LlamaMtmdClient:
             "--log-verbosity", "1",
             "--no-log-prefix",
         ]
-        if self.device:
-            args.extend(["--device", self.device])
+        args.extend(_llama_device_args(self.device))
 
         timeout = _env_int("BEATSYNC_QWEN_LLAMA_CLI_TIMEOUT", 300, lo=30, hi=3600)
         started = time.perf_counter()
@@ -767,6 +753,7 @@ class QwenLlamaClient:
         self.server: LlamaServerClient | None = None
         self.cli: LlamaMtmdClient | None = None
         self.load_seconds = 0.0
+        self.server_start_count = 0
         self.batch_size = self.target_slots
         self.response_path = response_path
         print(f"Qwen llama.cpp model: {self.paths.model.name}", flush=True)
@@ -779,6 +766,10 @@ class QwenLlamaClient:
     def model_id(self) -> str:
         return f"{self.paths.model_id} (llama.cpp Vulkan)"
 
+    def _new_server(self, ctx_size, slots):
+        self.server_start_count += 1
+        return LlamaServerClient(self.paths, self.device, ctx_size, self.response_path, slots)
+
     def _start_server_or_prepare_cli(self) -> None:
         if os.environ.get("BEATSYNC_QWEN_LLAMA_DISABLE_SERVER", "0") == "1":
             self._prepare_cli(_ctx_sizes()[0])
@@ -788,13 +779,7 @@ class QwenLlamaClient:
         last_error = ""
         for ctx_size in _ctx_sizes():
             try:
-                self.server = LlamaServerClient(
-                    self.paths,
-                    self.device,
-                    ctx_size,
-                    self.response_path,
-                    self.target_slots,
-                )
+                self.server = self._new_server(ctx_size, self.target_slots)
                 self.ctx_size = ctx_size
                 self.load_seconds = self.server.load_seconds
                 self.batch_size = self.server.slots
@@ -828,13 +813,7 @@ class QwenLlamaClient:
         self.cli = None
         self.target_slots = max(1, min(32, int(slots)))
         try:
-            self.server = LlamaServerClient(
-                self.paths,
-                self.device,
-                self.ctx_size,
-                self.response_path,
-                self.target_slots,
-            )
+            self.server = self._new_server(self.ctx_size, self.target_slots)
             self.load_seconds += self.server.load_seconds
             self.batch_size = self.server.slots
             print(
@@ -865,13 +844,7 @@ class QwenLlamaClient:
                     self.server.close()
                     self.server = None
                     try:
-                        self.server = LlamaServerClient(
-                            self.paths,
-                            self.device,
-                            fallback_ctx,
-                            self.response_path,
-                            self.target_slots,
-                        )
+                        self.server = self._new_server(fallback_ctx, self.target_slots)
                         self.ctx_size = fallback_ctx
                         self.load_seconds += self.server.load_seconds
                         self.batch_size = self.server.slots
@@ -1019,30 +992,29 @@ def _run_semantics_for_video(
         frame_items = _prefetch_candidate_frames(cap, fps, candidates, frame_width)
         timings["prefetch_seconds"] = time.perf_counter() - prefetch_started
         timings["frame_count"] = len(frame_items)
-        inference_started = time.perf_counter()
-        idx = 0
-        while idx < len(frame_items):
-            wave_size = max(1, int(client.batch_size or 1))
-            wave_items = frame_items[idx:idx + wave_size]
-            semantics.update(_run_inference_wave(client, wave_items, prompt, idx))
-            idx += len(wave_items)
-            elapsed = max(0.001, time.perf_counter() - inference_started)
-            rate = idx / elapsed
-            print(
-                f"Qwen llama.cpp tagged {idx}/{len(frame_items)} "
-                f"({rate:.2f}/s, batch {client.batch_size})",
-                flush=True,
-            )
+    finally:
+        # The same sampled images remain in RAM for this source only. Release
+        # the decoder and its buffers before GPU inference starts.
+        cap.release()
+    inference_started = time.perf_counter()
+    idx = 0
+    while idx < len(frame_items):
+        wave_size = max(1, int(client.batch_size or 1))
+        wave_items = frame_items[idx:idx + wave_size]
+        semantics.update(_run_inference_wave(client, wave_items, prompt, idx))
+        idx += len(wave_items)
         elapsed = max(0.001, time.perf_counter() - inference_started)
-        timings["inference_seconds"] = elapsed
-        timings["tag_count"] = len(semantics)
+        rate = idx / elapsed
         print(
-            f"Qwen llama.cpp semantic inference total: {len(semantics)}/{len(frame_items)} tags "
-            f"in {elapsed:.1f}s ({len(frame_items) / elapsed:.2f} candidates/s)",
+            f"Qwen llama.cpp tagged {idx}/{len(frame_items)} "
+            f"({rate:.2f}/s, batch {client.batch_size})",
             flush=True,
         )
-    finally:
-        cap.release()
+    elapsed = max(0.001, time.perf_counter() - inference_started)
+    timings['inference_seconds'] = elapsed
+    timings['tag_count'] = len(semantics)
+    print(f"Qwen llama.cpp semantic inference total: {len(semantics)}/{len(frame_items)} tags "
+          f"in {elapsed:.1f}s ({len(frame_items) / elapsed:.2f} candidates/s)", flush=True)
     return semantics, timings
 
 
@@ -1071,6 +1043,24 @@ def main() -> None:
 
     semantics_by_job: Dict[str, Dict[str, Dict]] = {}
     timings_by_job: Dict[str, Dict] = {}
+
+    def save_progress():
+        response = {
+            'model_load_seconds': client.load_seconds, 'model_id': client.model_id,
+            'batch_size': client.batch_size, 'peak_vram_gb': 0.,
+            'worker_pid': os.getpid(), 'server_start_count': client.server_start_count,
+            'total_seconds': time.perf_counter() - whole_started,
+            'timings_by_job': timings_by_job,
+        }
+        if legacy_single:
+            response['semantics'] = semantics_by_job.get('single', {})
+        else:
+            response['semantics_by_job'] = semantics_by_job
+        temporary = args.response + '.tmp'
+        with open(temporary, 'w', encoding='utf8') as file:
+            json.dump(response, file, indent=2)
+        os.replace(temporary, args.response)
+
     try:
         for job_index, job in enumerate(jobs, 1):
             job_id = str(job.get("job_id", job_index))
@@ -1090,26 +1080,13 @@ def main() -> None:
                 prompt=prompt,
             )
             semantics_by_job[job_id] = semantics
+            timings['server_pid'] = (client.server.process.pid if client.server and client.server.process else None)
+            timings['server_start_count'] = client.server_start_count
             timings_by_job[job_id] = timings
+            save_progress()
     finally:
         client.close()
-
-    total_seconds = time.perf_counter() - whole_started
-    response = {
-        "model_load_seconds": client.load_seconds,
-        "model_id": client.model_id,
-        "batch_size": client.batch_size,
-        "peak_vram_gb": 0.0,
-        "total_seconds": total_seconds,
-        "timings_by_job": timings_by_job,
-    }
-    if legacy_single:
-        response["semantics"] = semantics_by_job.get("single", {})
-    else:
-        response["semantics_by_job"] = semantics_by_job
-
-    with open(args.response, "w", encoding="utf-8") as f:
-        json.dump(response, f, indent=2)
+        save_progress()
 
 
 if __name__ == "__main__":

@@ -20,6 +20,10 @@ import shutil
 import uuid
 import re
 from typing import Tuple, List
+from pathlib import Path
+from fractions import Fraction
+import hashlib
+import math
 
 
 from logger import (
@@ -27,29 +31,27 @@ from logger import (
     FFMPEG_EXE as FFMPEG_PATH,
     check_nvenc as check_nvenc_support,
 )
-from gpu_cpu_utils import MAX_THREADS
+from gpu_cpu_utils import MAX_THREADS, PARALLEL_WORKERS
+from video_encoders import (VULKAN_ENCODERS, vulkan_device_args, vulkan_quality_args,
+                            nvenc_quality_args, get_encoder_support,
+                            nvenc_device_args, cuda_decode_args, get_prores_gpu_support)
+from gpu_devices import get_cuda_gpu
+from gpu_video import get_gpu_video_path
+from ffmpeg_runtime import (FFPROBE_EXE, MediaError, get_runtime_info, run_media_command,
+                            media_duration, video_fps, video_resolution, video_stream,
+                            verify_video, fps_string, normalize_output_size)
 
 # Initialize environment
 setup_environment()
 
 # Set up FFPROBE_PATH based on FFMPEG_PATH
-FFPROBE_PATH = FFMPEG_PATH.replace('ffmpeg.exe', 'ffprobe.exe')
-
-
-NVENC_QUALITY_CQ = '1'
-NVENC_LOOKAHEAD = '32'
-NVENC_AQ_STRENGTH = '12'
+FFPROBE_PATH = FFPROBE_EXE
 
 
 def _run_media_command(cmd: List[str], timeout: int) -> subprocess.CompletedProcess[str]:
     """Run an FFmpeg/FFprobe command with consistent capture settings."""
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    return run_media_command(cmd, timeout)
+
 
 
 def _safe_remove_file(path: str | None) -> None:
@@ -108,31 +110,8 @@ def _extract_scene_times(stderr: str) -> List[float]:
 
 
 def get_nvenc_quality_args(gpu_encoder: str, include_pix_fmt: bool = True) -> List[str]:
-    """Return high-quality NVENC settings for H.264/HEVC exports."""
-    args = [
-        '-c:v', gpu_encoder,
-        '-preset', 'p7',
-        '-tune', 'uhq' if gpu_encoder == 'hevc_nvenc' else 'hq',
-        '-rc', 'vbr',
-        '-b:v', '0',
-        '-cq', NVENC_QUALITY_CQ,
-        '-multipass', 'fullres',
-        '-rc-lookahead', NVENC_LOOKAHEAD,
-        '-spatial_aq', '1',
-        '-temporal_aq', '1',
-        '-aq-strength', NVENC_AQ_STRENGTH,
-        '-b_ref_mode', 'middle',
-    ]
-
-    if gpu_encoder == 'h264_nvenc':
-        args.extend(['-profile:v', 'high'])
-    elif gpu_encoder == 'hevc_nvenc':
-        args.extend(['-profile:v', 'main'])
-
-    if include_pix_fmt:
-        args.extend(['-pix_fmt', 'yuv420p'])
-
-    return args
+    """Use current NVENC options verified with the installed GPU driver."""
+    return nvenc_quality_args(gpu_encoder, include_pix_fmt)
 
 
 def get_cpu_h264_quality_args(include_pix_fmt: bool = True) -> List[str]:
@@ -144,79 +123,27 @@ def get_cpu_h264_quality_args(include_pix_fmt: bool = True) -> List[str]:
     ]
     if include_pix_fmt:
         args.extend(['-pix_fmt', 'yuv420p'])
-    args.extend(['-threads', str(MAX_THREADS)])
+    args.extend(['-threads', str(_render_threads())])
     return args
 
 
+def get_hardware_encoding_args(gpu_encoder: str) -> List[str]:
+    if gpu_encoder in VULKAN_ENCODERS:
+        # Hardware Vulkan frames are produced by format=nv12,hwupload.
+        return vulkan_quality_args(gpu_encoder)
+    return get_nvenc_quality_args(gpu_encoder, include_pix_fmt=True)
+
+
 def get_video_duration(video_file: str) -> float:
-    """Get the duration of a video file using ffprobe."""
-    try:
-        probe_cmd = [
-            FFPROBE_PATH,
-            '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            video_file
-        ]
-        
-        result = _run_media_command(probe_cmd, timeout=10)
-        duration = float(result.stdout.strip())
-        return duration
-    except Exception as e:
-        print(f"   ⚠️  Could not get video duration with ffprobe: {e}")
-        return 10.0  # Default fallback
+    return media_duration(video_file)
 
 
 def get_video_fps(video_file: str) -> float:
-    """Get the FPS of a video file using ffprobe."""
-    try:
-        probe_cmd = [
-            FFPROBE_PATH,
-            '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=r_frame_rate',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            video_file
-        ]
-        
-        result = _run_media_command(probe_cmd, timeout=10)
-        fps_str = result.stdout.strip()
-        
-        # Parse fraction (e.g., "30000/1001" or "30/1")
-        if '/' in fps_str:
-            num, den = fps_str.split('/')
-            fps = float(num) / float(den)
-        else:
-            fps = float(fps_str)
-        
-        return fps
-    except Exception as e:
-        print(f"   ⚠️  Could not get video FPS with ffprobe: {e}")
-        return 30.0  # Default fallback
+    return video_fps(video_file)
 
 
 def get_video_resolution(video_file: str) -> Tuple[int, int]:
-    """Get the resolution (width, height) of a video file using ffprobe."""
-    try:
-        probe_cmd = [
-            FFPROBE_PATH,
-            '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height',
-            '-of', 'json',
-            video_file
-        ]
-        
-        result = _run_media_command(probe_cmd, timeout=10)
-        data = json.loads(result.stdout)
-        
-        width = data['streams'][0]['width']
-        height = data['streams'][0]['height']
-        
-        return (width, height)
-    except Exception as e:
-        print(f"   ⚠️  Could not get video resolution with ffprobe: {e}")
-        return (1920, 1080)  # Default fallback
+    return video_resolution(video_file)
 
 
 def seconds_to_frame_count(seconds: float, fps: float) -> int:
@@ -235,430 +162,358 @@ def frame_count_to_seconds(frames: int, fps: float) -> float:
     return frames / fps
 
 
-def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None) -> str:
-    """
-    Convert video to ProRes 422 Proxy for lossless editing.
-    All frames are I-frames (keyframes) for frame-accurate cutting.
-    STRIPS AUDIO - we'll add the music track at the end.
-    """
-    filename = os.path.basename(video_file)
-    name, _ = os.path.splitext(filename)
-    output_file = os.path.join(output_dir, f"{name}_prores.mov")
-    
-    print(f"   📹 Converting to ProRes 422 Proxy: {filename}")
-    
-    # Detect FPS if not provided
-    if fps is None:
-        fps = get_video_fps(video_file)
-    
-    # Build FFmpeg command for ProRes 422 Proxy (NO AUDIO).
-    # ProRes encode/decode is CPU-native in FFmpeg; forcing hwaccel auto can make
-    # FFmpeg pick Vulkan/D3D paths that are slower or unstable for ProRes.
-    cmd = [
-        FFMPEG_PATH,
-        '-nostdin',
-        '-hide_banner',
-        '-i', video_file,
-        '-map', '0:v:0',
-        '-c:v', 'prores',  # ProRes encoder
-        '-profile:v', '0',  # Proxy quality (0=Proxy, 1=LT, 2=Standard, 3=HQ)
-        '-vendor', 'apl0',
-        '-pix_fmt', 'yuv422p10le',
-        '-an',  # ✅ STRIP AUDIO - we'll add music at the end
-        '-sn',
-        '-dn',
-        '-r', str(fps),  # Set frame rate
-        '-threads', str(MAX_THREADS),
-        '-y',
-        output_file
-    ]
-    
+def _render_threads():
+    default = max(1, min(8, MAX_THREADS // max(1, PARALLEL_WORKERS)))
     try:
-        result = _run_media_command(cmd, timeout=600)  # 10 minute timeout
-        
-        if result.returncode != 0:
-            print(f"   ⚠️  FFmpeg error: {result.stderr}")
-            raise Exception(f"ProRes conversion failed for {filename}")
-        
-        print(f"   ✓ ProRes conversion complete: {name}_prores.mov (video only, no audio)")
-        return output_file
-        
-    except subprocess.TimeoutExpired:
-        raise Exception(f"ProRes conversion timeout for {filename}")
-    except Exception as e:
-        raise Exception(f"ProRes conversion error: {str(e)}")
+        return max(1, min(MAX_THREADS, int(os.environ.get('BEATSYNC_FFMPEG_THREADS', default))))
+    except ValueError:
+        return default
+
+
+def _base_command():
+    get_runtime_info()
+    return [FFMPEG_PATH, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+            '-threads', str(_render_threads()), '-filter_threads', str(_render_threads())]
+
+
+def _container_args(output_file, fps, encoder=''):
+    if Path(output_file).suffix.lower() not in ('.mp4', '.mov'):
+        return []
+    args = ['-movflags', '+faststart', '-video_track_timescale',
+            str(Fraction(fps_string(fps)).numerator)]
+    if encoder.startswith('hevc_'):
+        args += ['-tag:v', 'hvc1']
+    return args
+
+
+def _scale_filters(target_size):
+    if not target_size:
+        return []
+    width, height = normalize_output_size(target_size)
+    return [f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1',
+            f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2', 'setsar=1']
+
+
+def _timing_filters(duration, output_duration, fps, target_size=None):
+    rate = fps_string(fps)
+    if not math.isfinite(float(duration)) or float(duration) <= 0:
+        raise ValueError(f'Invalid source clip duration: {duration}')
+    if not math.isfinite(float(output_duration)) or float(output_duration) <= 0:
+        raise ValueError(f'Invalid output clip duration: {output_duration}')
+    frames = max(1, seconds_to_frame_count(output_duration, fps))
+    # Source time is independent of the output FPS. Rounding it up can consume
+    # a frame from the next source shot, especially when retiming a clip.
+    source_duration = float(duration)
+    exact_output = frame_count_to_seconds(frames, fps)
+    filters = [f'trim=duration={source_duration}',
+               f'setpts={exact_output / source_duration:.10f}*(PTS-STARTPTS)']
+    filters += _scale_filters(target_size)
+    filters += [f'fps={rate}:start_time=0',
+                f'tpad=stop_mode=clone:stop_duration={exact_output}']
+    return filters, frames
+
+
+def _verify_output(result, output_file, frames=None):
+    if result.returncode:
+        raise MediaError(_short_ffmpeg_error(result.stderr))
+    if not os.path.isfile(output_file) or os.path.getsize(output_file) == 0:
+        raise MediaError(f'FFmpeg did not produce a video: {output_file}')
+    verify_video(output_file, frames)
+
+
+def _prores_args():
+    return ['-c:v', 'prores_ks', '-profile:v', '3', '-vendor', 'apl0', '-tag:v', 'apch',
+            '-pix_fmt', 'yuv422p10le', '-threads', str(MAX_THREADS)]
+
+
+def _prores_commands(video_file, output_file, fps, target_size, filters, frames=None, start_time=None, use_gpu=True,
+                     source_duration=None):
+    commands = []
+    if use_gpu and get_prores_gpu_support()['available']:
+        route = get_gpu_video_path(video_file, 'vulkan')
+        if route:
+            width, height = normalize_output_size(target_size or get_video_resolution(video_file))
+            # Preserve ProRes's 10-bit 4:2:2 precision when software decoding
+            # an unsupported input; an NV12 upload would discard both.
+            upload = [] if route.hardware_decode else ['format=yuv422p10le', 'hwupload']
+            gpu_filters = upload + route.scale_filters(width, height, contain=True, pixel_format='yuv422p10le')
+            gpu_filters += filters
+            cmd = _base_command() + route.input_args()
+            if start_time is not None:
+                cmd += ['-ss', str(start_time)]
+            if source_duration is not None:
+                cmd += ['-t', str(source_duration)]
+            cmd += ['-i', video_file, '-map', '0:v:0', '-vf', ','.join(gpu_filters),
+                    '-c:v', 'prores_ks_vulkan', '-profile:v', '3', '-vendor', 'apl0',
+                    '-tag:v', 'apch', '-async_depth', '4']
+            if frames is not None:
+                cmd += ['-frames:v', str(frames)]
+            cmd += ['-an', '-sn', '-dn', '-fps_mode', 'cfr'] + _container_args(output_file, fps) + [output_file]
+            commands.append(cmd)
+    cmd = _base_command()
+    if start_time is not None:
+        cmd += ['-ss', str(start_time)]
+    if source_duration is not None:
+        cmd += ['-t', str(source_duration)]
+    cmd += ['-i', video_file, '-map', '0:v:0', '-vf', ','.join(_scale_filters(target_size) + filters)]
+    if frames is not None:
+        cmd += ['-frames:v', str(frames)]
+    cmd += _prores_args() + ['-an', '-sn', '-dn', '-fps_mode', 'cfr']
+    cmd += _container_args(output_file, fps) + [output_file]
+    commands.append(cmd)
+    return commands
+
+
+def _run_prores_commands(commands, output_file, timeout, frames=None):
+    for i, cmd in enumerate(commands):
+        result = _run_media_command(cmd, timeout=timeout)
+        if result.returncode and i + 1 < len(commands):
+            print(f'   Vulkan ProRes failed; retrying CPU ProRes: {_short_ffmpeg_error(result.stderr, 600)}')
+            continue
+        _verify_output(result, output_file, frames)
+        return
+
+
+def convert_to_prores_hq(video_file: str, output_dir: str, fps: float = None,
+                            target_size: Tuple[int, int] = None, use_gpu: bool = True) -> str:
+    """Create 10-bit 4:2:2 ProRes HQ; subsequent stream copying is lossless."""
+    os.makedirs(output_dir, exist_ok=True)
+    name = Path(video_file).stem
+    identity = hashlib.sha256(os.path.abspath(video_file).encode('utf8')).hexdigest()[:10]
+    output_file = os.path.join(output_dir, f'{name}_{identity}_prores.mov')
+    fps = get_video_fps(video_file) if fps is None else fps
+    target_size = target_size or get_video_resolution(video_file)
+    filters = [f'fps={fps_string(fps)}:start_time=0']
+    commands = _prores_commands(video_file, output_file, fps, target_size, filters, use_gpu=use_gpu)
+    print(f'   📹 Converting to ProRes 422 HQ: {Path(video_file).name}')
+    _run_prores_commands(commands, output_file, timeout=max(600, int(get_video_duration(video_file) * 8)))
+    return output_file
 
 
 def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: float,
                                 output_file: str, fps: float, target_size: Tuple[int, int],
-                                use_nvenc: bool,
-                                gpu_encoder: str = 'h264_nvenc') -> bool:
-    """
-    Extract a video segment using FFmpeg with FRAME-ACCURATE timing.
-    
-    ✅ FRAME-ACCURATE: Uses exact frame counts instead of floating-point seconds
-    ✅ ZERO DRIFT: No cumulative timing errors
-    """
+                                use_nvenc: bool, gpu_encoder: str = 'h264_nvenc',
+                                output_duration: float = None) -> bool:
+    """Render exact output frames. The legacy use_nvenc flag selects hardware encoding."""
     try:
-        # ✅ FRAME-ACCURATE: Calculate exact source and output frame counts.
-        source_frame_count = max(1, seconds_to_frame_count(duration, fps))
-        exact_source_duration = frame_count_to_seconds(source_frame_count, fps)
-        output_frame_count = source_frame_count
-
-        # Build filter complex
-        filters = []
-
-        # Trim first so each extracted segment has exact timing.
-        filters.extend([f"trim=duration={exact_source_duration}", "setpts=PTS-STARTPTS"])
-        
-        # Scale to target size
-        if target_size:
-            width, height = target_size
-            filters.append(f"scale={width}:{height}")
-        
-        # FPS filter
-        filters.append(f"fps={fps}")
-        
-        filter_complex = ",".join(filters)
-        
-        # Build FFmpeg command
-        cmd = [FFMPEG_PATH]
-        
-        # Hardware acceleration
-        if use_nvenc:
-            cmd.extend(['-hwaccel', 'cuda'])
-        else:
-            cmd.extend(['-hwaccel', 'auto'])
-        
-        # ✅ FRAME-ACCURATE INPUT SEEKING
-        # Use -ss BEFORE -i for faster seeking (keyframe-based)
-        # Then use -ss AFTER -i for frame-accurate positioning
-        cmd.extend([
-            '-ss', str(start_time),
-            '-t', str(exact_source_duration),
-            '-i', video_file
-        ])
-        
-        # Video filters
-        cmd.extend(['-vf', filter_complex])
-        
-        # ✅ FRAME-ACCURATE DURATION: Use -vframes instead of -t
-        cmd.extend(['-vframes', str(output_frame_count)])
-        
-        # Video encoding
-        if use_nvenc:
-            cmd.extend(get_nvenc_quality_args(gpu_encoder, include_pix_fmt=True))
-        else:
-            cmd.extend(get_cpu_h264_quality_args(include_pix_fmt=True))
-        
-        # No audio, frame-accurate settings
-        cmd.extend([
-            '-an',
-            '-fps_mode', 'cfr',  # Constant frame rate
-            '-r', str(fps),   # Exact output FPS
-            '-fflags', '+genpts',
-            '-movflags', '+faststart',
-            '-y',
-            output_file
-        ])
-        
-        result = _run_media_command(cmd, timeout=120)
-        
-        if result.returncode != 0:
-            print(f"   ⚠️  FFmpeg error: {result.stderr}")
-            return False
-        
-        # Verify output exists and has content
-        if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
-            return False
-        
-        return True
-        
-    except Exception as e:
-        print(f"   ⚠️  Error extracting clip: {e}")
-        return False
+        start_time = max(0.0, float(start_time))
+        if not math.isfinite(start_time):
+            raise ValueError('Invalid source start time')
+        output_duration = duration if output_duration is None else output_duration
+        filters, frames = _timing_filters(duration, output_duration, fps, target_size)
+        use_vulkan = use_nvenc and gpu_encoder in VULKAN_ENCODERS
+        commands = []
+        route = None
+        if use_nvenc and _env_flag('BEATSYNC_GPU_VIDEO_DECODE'):
+            route = get_gpu_video_path(video_file, 'vulkan' if use_vulkan else 'cuda',
+                                       hardware_decode=_env_flag('BEATSYNC_FFMPEG_CUDA_DECODE'))
+        if route:
+            timing, _ = _timing_filters(duration, output_duration, fps)
+            width, height = normalize_output_size(target_size or get_video_resolution(video_file))
+            gpu_filters = (timing[:2] + route.upload_filters()
+                           + route.scale_filters(width, height, contain=True) + timing[2:])
+            cmd = _base_command() + route.input_args()
+            cmd += ['-ss', str(start_time), '-t', str(duration), '-i', video_file, '-map', '0:v:0',
+                    '-vf', ','.join(gpu_filters), '-frames:v', str(frames)]
+            cmd += vulkan_quality_args(gpu_encoder) if use_vulkan else nvenc_quality_args(gpu_encoder, include_pix_fmt=False)
+            cmd += ['-an', '-sn', '-dn', '-fps_mode', 'cfr']
+            cmd += _container_args(output_file, fps, gpu_encoder) + [output_file]
+            commands.append(cmd)
+        cmd = _base_command()
+        if use_vulkan:
+            cmd += vulkan_device_args(gpu_encoder)
+        fallback_filters = filters + (['format=nv12', 'hwupload'] if use_vulkan else [])
+        cmd += ['-ss', str(start_time), '-t', str(duration), '-i', video_file, '-map', '0:v:0',
+                '-vf', ','.join(fallback_filters), '-frames:v', str(frames)]
+        cmd += get_hardware_encoding_args(gpu_encoder) if use_nvenc else get_cpu_h264_quality_args()
+        cmd += ['-an', '-sn', '-dn', '-fps_mode', 'cfr']
+        cmd += _container_args(output_file, fps, gpu_encoder if use_nvenc else '') + [output_file]
+        commands.append(cmd)
+        for index, cmd in enumerate(commands):
+            result = _run_media_command(cmd, timeout=max(120, int(output_duration * 20)))
+            if result.returncode and index + 1 < len(commands):
+                print(f'   ⚠️ GPU decode/filter failed; retrying CPU decode/filter with GPU encoding: {_short_ffmpeg_error(result.stderr, 500)}')
+                continue
+            _verify_output(result, output_file, frames)
+            return True
+    except Exception as exc:
+        print(f'   ⚠️ Clip extraction failed: {exc}')
+    return False
 
 
 def extract_prores_segment_random(video_file: str, duration: float, fps: float,
                                   temp_dir: str, segment_index: int,
-                                  start_time: float = None) -> str:
-    """
-    Extract a segment from a ProRes proxy with frame-perfect precision.
-
-    Important stability fix:
-    - Do NOT use '-hwaccel auto' here. FFmpeg can select Vulkan/D3D hwaccel for
-      ProRes, which is unnecessary for ProRes and can fail on some Windows GPU
-      driver combinations.
-    - Use a CPU-native ProRes path, exact frame count, and a safe retry command.
-    """
-    output_file = os.path.join(temp_dir, f"segment_{segment_index:05d}.mov")
-
+                                  start_time: float = None,
+                                  output_duration: float = None, target_size: Tuple[int, int] = None,
+                                  use_gpu: bool = True) -> str:
+    output_file = os.path.join(temp_dir, f'segment_{segment_index:05d}.mov')
     video_duration = get_video_duration(video_file)
-    if video_duration <= 0:
-        raise Exception(f"Invalid ProRes source duration: {video_file}")
+    output_duration = duration if output_duration is None else output_duration
+    duration = min(duration, video_duration)
+    max_start = max(0.0, video_duration - duration)
+    start_time = random.uniform(0, max_start) if start_time is None else max(0.0, min(float(start_time), max_start))
+    filters, frames = _timing_filters(duration, output_duration, fps)
+    commands = _prores_commands(video_file, output_file, fps, target_size or get_video_resolution(video_file),
+                               filters, frames=frames, start_time=start_time, use_gpu=use_gpu, source_duration=duration)
+    _run_prores_commands(commands, output_file, timeout=max(180, int(output_duration * 20)), frames=frames)
+    return output_file
 
-    if video_duration >= duration:
-        max_start = max(0.0, video_duration - duration)
-        if start_time is None:
-            start_time = random.uniform(0.0, max_start)
-        else:
-            start_time = max(0.0, min(float(start_time), max_start))
-    else:
-        start_time = 0.0
-        duration = video_duration
 
-    frame_count = max(1, seconds_to_frame_count(duration, fps))
-    exact_duration = frame_count_to_seconds(frame_count, fps)
+def _concat_path(path):
+    value = os.path.abspath(path).replace('\\', '/')
+    if '\n' in value or '\r' in value:
+        raise ValueError('Media filenames cannot contain line breaks')
+    return "'" + value.replace("'", "'\\''") + "'"
 
-    filters = [f"trim=duration={exact_duration}", "setpts=PTS-STARTPTS"]
-    filters.append(f"fps={fps}")
-    filter_complex = ",".join(filters)
 
-    def build_cmd(fast_seek: bool) -> List[str]:
-        cmd = [FFMPEG_PATH, '-nostdin', '-hide_banner']
-        if fast_seek:
-            # ProRes proxy is intra-frame, so input-side seeking remains accurate
-            # while being much faster for long sources.
-            cmd.extend(['-ss', f'{start_time:.6f}', '-i', video_file])
-        else:
-            # Ultra-safe fallback. Slower on long sources, but avoids muxer/seek
-            # edge cases if a specific FFmpeg build rejects the fast path.
-            cmd.extend(['-i', video_file, '-ss', f'{start_time:.6f}'])
-
-        cmd.extend([
-            '-map', '0:v:0',
-            '-vf', filter_complex,
-            '-vframes', str(frame_count),
-            '-c:v', 'prores',
-            '-profile:v', '0',
-            '-vendor', 'apl0',
-            '-pix_fmt', 'yuv422p10le',
-            '-r', str(fps),
-            '-fps_mode', 'cfr',
-            '-fflags', '+genpts',
-            '-an',
-            '-sn',
-            '-dn',
-            '-threads', str(MAX_THREADS),
-            '-y',
-            output_file,
-        ])
-        return cmd
-
-    last_error = ""
-    for attempt_name, fast_seek, timeout in [
-        ('fast intra-frame seek', True, 180),
-        ('safe accurate seek retry', False, 360),
-    ]:
-        _safe_remove_file(output_file)
-        result = _run_media_command(build_cmd(fast_seek), timeout=timeout)
-        if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-            return output_file
-        last_error = _short_ffmpeg_error(result.stderr)
-        print(f"   ⚠️  ProRes extraction failed on {attempt_name}: {last_error}")
-
-    raise Exception(f"ProRes segment extraction error: {last_error}")
-
-def concatenate_videos_ffmpeg(video_files: List[str], output_file: str, 
+def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                               audio_file: str = None, start_time: float = 0.0,
                               end_time: float = None, use_nvenc: bool = False,
                               gpu_encoder: str = 'h264_nvenc', fps: float = 30.0,
-                              temp_dir: str = None) -> str:
-    """
-    Concatenate video files using FFmpeg concat demuxer.
-    
-    ✅ FRAME-ACCURATE: Maintains precise timing through concatenation
-    """
-    if temp_dir is None:
-        temp_dir = os.path.dirname(output_file)
-    
-    # Create concat file
-    concat_file = os.path.join(temp_dir, f'concat_list_{uuid.uuid4().hex}.txt')
-    with open(concat_file, 'w', encoding='utf-8') as f:
-        for video_file in video_files:
-            escaped_path = video_file.replace('\\', '/')
-            f.write(f"file '{escaped_path}'\n")
-    
-    is_prores = output_file.lower().endswith('.mov')
-    temp_video = None
-    temp_audio = None
-    
+                              temp_dir: str = None, output_duration: float = None,
+                              clip_frame_counts: List[int] = None) -> str:
+    """Assemble one frame-locked timeline and commit the verified output atomically."""
+    if not video_files:
+        raise ValueError('No clips to concatenate')
+    fps_string(fps)
+    temp_dir = temp_dir or os.path.dirname(os.path.abspath(output_file))
+    os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+    concat_file = os.path.join(temp_dir, f'concat_{uuid.uuid4().hex}.ffconcat')
+    target = Path(output_file)
+    staging = str(target.with_name(f'{target.stem}_{uuid.uuid4().hex}.partial{target.suffix}'))
+    if clip_frame_counts is not None and len(clip_frame_counts) != len(video_files):
+        raise ValueError('Clip frame counts must match the input clips')
     try:
-        if is_prores:
-            # ProRes: concat with stream copy (lossless)
-            print(f"   🔗 Concatenating {len(video_files)} segments (lossless stream copy)...")
-            
-            temp_video = os.path.join(temp_dir, f'video_only_{uuid.uuid4().hex}.mov')
-            
-            cmd = [
-                FFMPEG_PATH,
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', concat_file,
-                '-c', 'copy',
-                '-y',
-                temp_video
-            ]
-            
-            result = _run_media_command(cmd, timeout=300)
-            
-            if result.returncode != 0:
-                raise Exception(f"Concatenation failed: {result.stderr}")
-            
-            # Add audio if provided
+        with open(concat_file, 'w', encoding='utf8', newline='\n') as script:
+            script.write('ffconcat version 1.0\n')
+            for index, file in enumerate(video_files):
+                script.write(f'file {_concat_path(file)}\n')
+                if clip_frame_counts is not None:
+                    script.write(f'duration {frame_count_to_seconds(clip_frame_counts[index], fps):.12f}\n')
+        if output_duration is None:
+            output_duration = sum(get_video_duration(file) for file in video_files)
             if audio_file:
-                print(f"   🎵 Adding music track...")
-                
-                temp_audio = os.path.join(temp_dir, f'music_{uuid.uuid4().hex}.wav')
-                
-                audio_cmd = [FFMPEG_PATH, '-i', audio_file]
-                
-                if end_time and end_time > start_time:
-                    audio_cmd.extend(['-ss', str(start_time), '-t', str(end_time - start_time)])
-                elif start_time > 0:
-                    audio_cmd.extend(['-ss', str(start_time)])
-                
-                audio_cmd.extend([
-                    '-acodec', 'pcm_s24le',
-                    '-ar', '48000',
-                    '-ac', '2',
-                    '-y',
-                    temp_audio
-                ])
-                
-                result = _run_media_command(audio_cmd, timeout=120)
-                
-                if result.returncode != 0:
-                    raise Exception(f"Audio extraction failed: {result.stderr}")
-                
-                # Combine video + audio with AUDIO as master timeline
-                cmd = [
-                    FFMPEG_PATH,
-                    '-i', temp_video,
-                    '-i', temp_audio,
-                    '-map', '0:v',
-                    '-map', '1:a',
-                    '-c:v', 'copy',
-                    '-c:a', 'pcm_s24le',
-                    '-ar', '48000',
-                    '-shortest',  # Use shortest stream (audio)
-                    '-y',
-                    output_file
-                ]
-                
-                result = _run_media_command(cmd, timeout=300)
-                
-                if result.returncode != 0:
-                    raise Exception(f"Audio merging failed: {result.stderr}")
-                
-                _safe_remove_file(temp_video)
-                _safe_remove_file(temp_audio)
-            else:
-                shutil.move(temp_video, output_file)
-        
-        else:
-            # H.264/H.265 standard path. Temp clips were already encoded with
-            # matching FPS/resolution/codec settings, so the fastest safe path is
-            # stream-copy concatenation plus audio mux. If a specific codec/container
-            # combination rejects stream copy, fall back to the old re-encode path.
-            fast_concat_enabled = _env_flag('BEATSYNC_FAST_CONCAT_COPY', True)
+                audio_duration = get_video_duration(audio_file) - start_time
+                if end_time is not None and end_time > start_time:
+                    audio_duration = min(audio_duration, end_time - start_time)
+                output_duration = min(output_duration, audio_duration)
+        if output_duration <= 0 or not math.isfinite(output_duration):
+            raise ValueError('Invalid final timeline duration')
+        frames = max(1, seconds_to_frame_count(output_duration, fps))
+        exact_duration = frame_count_to_seconds(frames, fps)
+        is_prores = gpu_encoder == 'prores_ks' or (
+            not use_nvenc and target.suffix.lower() == '.mov' and video_stream(video_files[0])['codec_name'] == 'prores')
 
-            def add_audio_input(cmd: List[str]) -> None:
-                if not audio_file:
-                    return
-                if end_time and end_time > start_time:
-                    cmd.extend(['-ss', str(start_time), '-t', str(end_time - start_time), '-i', audio_file])
-                elif start_time > 0:
-                    cmd.extend(['-ss', str(start_time), '-i', audio_file])
+        def build_command(copy):
+            cmd = _base_command()
+            if not copy and use_nvenc and gpu_encoder in VULKAN_ENCODERS:
+                cmd += vulkan_device_args(gpu_encoder)
+            cmd += ['-f', 'concat', '-safe', '0', '-i', concat_file]
+            if audio_file:
+                cmd += ['-ss', str(max(0.0, start_time))]
+                if end_time is not None and end_time > start_time:
+                    cmd += ['-t', str(end_time - start_time)]
+                cmd += ['-i', audio_file]
+            cmd += ['-map', '0:v:0']
+            if audio_file:
+                cmd += ['-map', '1:a:0', '-c:a', 'pcm_s24le', '-ar', '48000',
+                        '-af', 'asetpts=PTS-STARTPTS']
+            if copy:
+                cmd += ['-c:v', 'copy']
+            else:
+                filters = [f'fps={fps_string(fps)}:start_time=0',
+                           f'tpad=stop_mode=clone:stop_duration={exact_duration}']
+                if use_nvenc and gpu_encoder in VULKAN_ENCODERS:
+                    filters += ['format=nv12', 'hwupload']
+                cmd += ['-vf', ','.join(filters)]
+                if is_prores:
+                    cmd += _prores_args()
+                elif use_nvenc:
+                    cmd += get_hardware_encoding_args(gpu_encoder)
                 else:
-                    cmd.extend(['-i', audio_file])
+                    cmd += get_cpu_h264_quality_args()
+                cmd += ['-fps_mode', 'cfr']
+            # Explicit end and frame count preserve the last reordered frame;
+            # -shortest previously truncated some NVENC/Vulkan + PCM exports.
+            cmd += ['-frames:v', str(frames), '-t', str(exact_duration), '-sn', '-dn']
+            cmd += _container_args(staging, fps, gpu_encoder if use_nvenc else '')
+            return cmd + [staging]
 
-            if fast_concat_enabled:
-                print(f"   🔗 Fast final assembly: concat stream-copy video + mux audio...")
-                copy_started = time.perf_counter()
-                cmd = [
-                    FFMPEG_PATH,
-                    '-nostdin',
-                    '-hide_banner',
-                    '-f', 'concat',
-                    '-safe', '0',
-                    '-i', concat_file,
-                ]
-                add_audio_input(cmd)
-                if audio_file:
-                    cmd.extend(['-map', '0:v:0', '-map', '1:a:0'])
-                else:
-                    cmd.extend(['-map', '0:v:0'])
-                cmd.extend(['-c:v', 'copy'])
-                if audio_file:
-                    cmd.extend(['-c:a', 'pcm_s24le', '-ar', '48000', '-shortest'])
-                cmd.extend(['-fflags', '+genpts', '-movflags', '+faststart', '-y', output_file])
-
-                result = _run_media_command(cmd, timeout=300)
-                if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-                    print(f"   ✓ Fast concat-copy complete in {_fmt_seconds(time.perf_counter() - copy_started)}")
-                    return output_file
-                print(
-                    f"   ⚠️  Fast concat-copy failed in {_fmt_seconds(time.perf_counter() - copy_started)}; "
-                    f"falling back to re-encode. {_short_ffmpeg_error(result.stderr, 900)}"
-                )
-
-            # Fallback/original behavior: H.264/H.265 full re-encode.
-            print(f"   🔗 Concatenating and encoding {len(video_files)} segments...")
-            encode_started = time.perf_counter()
-            cmd = [FFMPEG_PATH]
-            
-            if use_nvenc:
-                cmd.extend(['-hwaccel', 'cuda'])
-            else:
-                cmd.extend(['-hwaccel', 'auto'])
-            
-            cmd.extend([
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', concat_file
-            ])
-            
-            add_audio_input(cmd)
-            if audio_file:
-                cmd.extend(['-map', '0:v', '-map', '1:a'])
-            
-            if use_nvenc:
-                cmd.extend(get_nvenc_quality_args(gpu_encoder, include_pix_fmt=True))
-            else:
-                cmd.extend(get_cpu_h264_quality_args(include_pix_fmt=True))
-            
-            if audio_file:
-                cmd.extend([
-                    '-c:a', 'pcm_s24le',
-                    '-ar', '48000',
-                    '-shortest',
-                ])
-            
-            cmd.extend([
-                '-fps_mode', 'cfr',
-                '-r', str(fps),
-                '-y',
-                output_file
-            ])
-            
-            result = _run_media_command(cmd, timeout=600)
-            
-            if result.returncode != 0:
-                raise Exception(f"Encoding failed: {result.stderr}")
-            print(f"   ✓ Full final re-encode complete in {_fmt_seconds(time.perf_counter() - encode_started)}")
-        
-        return output_file
+        copy_enabled = _env_flag('BEATSYNC_FAST_CONCAT_COPY', True)
+        for copy in ([True, False] if copy_enabled else [False]):
+            started = time.perf_counter()
+            print('   🔗 Final assembly: ' + ('stream copy + music' if copy else 'full re-encode + music'))
+            result = _run_media_command(build_command(copy), timeout=max(600, int(exact_duration * 10)))
+            try:
+                _verify_output(result, staging, frames)
+            except MediaError as exc:
+                if not copy:
+                    raise
+                print(f'   ⚠️ Copy assembly failed; retrying a full re-encode: {exc}')
+                _safe_remove_file(staging)
+                continue
+            os.replace(staging, output_file)
+            print(f'   ✓ Final assembly complete in {_fmt_seconds(time.perf_counter() - started)}')
+            return output_file
     finally:
         _safe_remove_file(concat_file)
-        _safe_remove_file(temp_audio)
-        _safe_remove_file(temp_video)
+        _safe_remove_file(staging)
+
+
+def create_browser_preview(video_file: str, output_file: str) -> str:
+    """H.264/AAC MP4 for browser playback, retaining the original export separately."""
+    target = Path(output_file)
+    staging = str(target.with_name(f'{target.stem}_{uuid.uuid4().hex}.partial.mp4'))
+    try:
+        use_nvenc = get_encoder_support('h264_nvenc')['available']
+        use_vulkan = not use_nvenc and get_encoder_support('h264_vulkan')['available']
+        commands = []
+        route = get_gpu_video_path(video_file, 'cuda' if use_nvenc else 'vulkan') if (use_nvenc or use_vulkan) else None
+        if route:
+            width, height = normalize_output_size(get_video_resolution(video_file))
+            filters = route.upload_filters() + route.scale_filters(width, height, contain=True)
+            gpu_cmd = _base_command() + route.input_args()
+            gpu_cmd += ['-i', video_file, '-map', '0:v:0', '-map', '0:a:0?', '-vf', ','.join(filters)]
+            if use_nvenc:
+                gpu_cmd += ['-c:v', 'h264_nvenc'] + nvenc_device_args()
+                gpu_cmd += ['-preset', 'p5', '-rc', 'vbr', '-cq', '23', '-b:v', '0']
+            else:
+                gpu_cmd += vulkan_quality_args('h264_vulkan')
+            commands.append(gpu_cmd)
+        cmd = _base_command()
+        if use_vulkan:
+            cmd += vulkan_device_args('h264_vulkan')
+        cmd += ['-i', video_file, '-map', '0:v:0', '-map', '0:a:0?']
+        if use_nvenc:
+            cmd += ['-c:v', 'h264_nvenc'] + nvenc_device_args()
+            cmd += ['-preset', 'p5', '-rc', 'vbr', '-cq', '23', '-b:v', '0']
+        elif use_vulkan:
+            cmd += ['-vf', 'format=nv12,hwupload'] + vulkan_quality_args('h264_vulkan')
+        else:
+            cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
+        if not use_vulkan:
+            cmd += ['-pix_fmt', 'yuv420p']
+        commands.append(cmd)
+        for index, command in enumerate(commands):
+            command += ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2',
+                        '-movflags', '+faststart', '-sn', '-dn', staging]
+            result = _run_media_command(command, timeout=max(180, int(get_video_duration(video_file) * 10)))
+            if result.returncode and index + 1 < len(commands):
+                print(f'   GPU preview decode/filter failed; retrying CPU decode with GPU encoding: {_short_ffmpeg_error(result.stderr, 500)}')
+                continue
+            _verify_output(result, staging)
+            break
+        os.replace(staging, output_file)
+        return output_file
+    finally:
+        _safe_remove_file(staging)
 
 
 def detect_video_scene_changes(video_path: str, threshold: float = 0.28,
-                               use_gpu: bool = False,
+                               use_gpu: bool = True,
                                analysis_fps: float = 8.0,
-                               analysis_width: int = 384) -> List[float]:
+                               analysis_width: int = 768) -> List[float]:
     """
     Detect likely montage/scene changes using FFmpeg's scene score.
 
@@ -680,25 +535,26 @@ def detect_video_scene_changes(video_path: str, threshold: float = 0.28,
             f"scale={analysis_width}:-2:flags=fast_bilinear,"
             f"select='gt(scene,{threshold})',showinfo"
         )
-        filter_gpu = (
-            f"scale_cuda={analysis_width}:-2,"
-            f"hwdownload,format=nv12,"
-            f"fps={analysis_fps},"
-            f"select='gt(scene,{threshold})',showinfo"
-        )
-
         commands = []
-        if use_gpu:
+        route = get_gpu_video_path(video_path) if use_gpu else None
+        if route is not None:
+            width, height = get_video_resolution(video_path)
+            analysis_height = max(2, int(round(height * analysis_width / width / 2)) * 2)
+            # Reduce the frame rate while frames are still on the GPU. Doing
+            # this after hwdownload unnecessarily transferred every frame.
+            gpu_filters = [f'fps={analysis_fps}'] + route.upload_filters()
+            gpu_filters += route.scale_filters(analysis_width, analysis_height)
+            gpu_filters += ['hwdownload', 'format=nv12',
+                            f"select='gt(scene,{threshold})'", 'showinfo']
             commands.append((
-                'GPU-assisted CUDA decode/scale',
+                f'GPU-assisted {route.label}',
                 [
                     FFMPEG_PATH,
                     '-nostdin',
                     '-hide_banner',
-                    '-hwaccel', 'cuda',
-                    '-hwaccel_output_format', 'cuda',
+                    *route.input_args(),
                     '-i', video_path,
-                    '-vf', filter_gpu,
+                    '-vf', ','.join(gpu_filters),
                     '-an', '-sn', '-dn',
                     '-f', 'null',
                     '-'
@@ -723,7 +579,7 @@ def detect_video_scene_changes(video_path: str, threshold: float = 0.28,
         last_error = ''
         for label, cmd in commands:
             if label.startswith('GPU'):
-                print("   ⚡ GPU scene analysis: CUDA decode/scale + CPU scene score")
+                print(f"   ⚡ GPU scene analysis: {route.label} + small CPU scene score")
             else:
                 if use_gpu:
                     print("   ↪ GPU scene analysis unavailable/failed, using CPU fallback")

@@ -95,6 +95,92 @@ def analyze_sections(y: np.ndarray, y_harmonic: np.ndarray, y_percussive: np.nda
     return sections or [{"index": 0, "start": 0.0, "end": duration, "duration": duration, "type": "body"}]
 
 
+def refine_musical_anchors(beat_times: np.ndarray, sections: List[Dict],
+                           features: Dict, cfg: AutoWaveConfig) -> Dict:
+    """Snap bar/phrase anchors to section starts and major musical events."""
+    beats = np.asarray(beat_times, dtype=float)
+    if beats.size == 0:
+        return features
+
+    bar_anchor = np.asarray(features.get("is_bar_anchor", np.zeros(beats.size, dtype=bool)), dtype=bool).copy()
+    phrase_anchor = np.asarray(features.get("is_phrase_anchor", np.zeros(beats.size, dtype=bool)), dtype=bool).copy()
+    if bar_anchor.size != beats.size:
+        bar_anchor = np.zeros(beats.size, dtype=bool)
+    if phrase_anchor.size != beats.size:
+        phrase_anchor = np.zeros(beats.size, dtype=bool)
+
+    impact = _feature_or_default(features, "impact_score", beats.size, 0.5)
+    novelty = _feature_or_default(features, "novelty", beats.size, 0.0)
+    confidence = _feature_or_default(features, "beat_confidence", beats.size, 0.5)
+    wave = _feature_or_default(features, "wave", beats.size, 0.5)
+    anchor_score = 0.42 * impact + 0.28 * confidence + 0.20 * novelty + 0.10 * wave
+
+    phrase_size = max(1, int(cfg.phrase_beats))
+    search_radius = max(1, min(3, phrase_size // 2))
+
+    for section in sections or []:
+        start = float(section.get("start", 0.0))
+        end = float(section.get("end", start))
+        section_indices = np.where((beats >= start) & (beats < end))[0]
+        if section_indices.size == 0:
+            continue
+
+        first_local = int(section_indices[0])
+        first_anchor = _best_anchor_near(first_local, anchor_score, search_radius)
+        phrase_anchor[first_anchor] = True
+        bar_anchor[first_anchor] = True
+
+        local_positions = np.arange(0, section_indices.size, phrase_size, dtype=int)
+        for local_pos in local_positions:
+            idx = int(section_indices[min(local_pos, section_indices.size - 1)])
+            best = _best_anchor_near(idx, anchor_score, search_radius)
+            phrase_anchor[best] = True
+
+    peak_threshold = max(
+        _safe_percentile(anchor_score, 92, 0.90),
+        _safe_percentile(anchor_score, 70, 0.70) + 0.08,
+    )
+    min_peak_gap = max(2, phrase_size // 2)
+    last_peak = -999
+    for idx in np.argsort(anchor_score)[::-1]:
+        idx = int(idx)
+        if anchor_score[idx] < peak_threshold:
+            break
+        if idx - last_peak < min_peak_gap and last_peak >= 0:
+            continue
+        phrase_anchor[idx] = True
+        last_peak = idx
+
+    downbeat_confidence = np.asarray(features.get("downbeat_confidence", np.zeros(beats.size)), dtype=float)
+    if downbeat_confidence.size != beats.size:
+        downbeat_confidence = np.zeros(beats.size, dtype=float)
+    downbeat_confidence = np.maximum(downbeat_confidence, np.where(bar_anchor, 0.72, 0.0))
+    downbeat_confidence = np.maximum(downbeat_confidence, np.where(phrase_anchor, 0.86, 0.0))
+
+    features["is_bar_anchor"] = bar_anchor
+    features["is_phrase_anchor"] = phrase_anchor
+    features["downbeat_confidence"] = np.clip(downbeat_confidence, 0.0, 1.0)
+    return features
+
+
+def _feature_or_default(features: Dict, key: str, size: int, default: float) -> np.ndarray:
+    arr = np.asarray(features.get(key, []), dtype=float)
+    if arr.size != size:
+        return np.zeros(size, dtype=float) + default
+    return np.nan_to_num(arr, nan=default, posinf=default, neginf=default)
+
+
+def _best_anchor_near(index: int, score: np.ndarray, radius: int) -> int:
+    if score.size == 0:
+        return max(0, index)
+    lo = max(0, int(index) - int(radius))
+    hi = min(score.size, int(index) + int(radius) + 1)
+    if hi <= lo:
+        return max(0, min(score.size - 1, int(index)))
+    local = score[lo:hi]
+    return int(lo + int(np.argmax(local)))
+
+
 def merge_boundaries(boundaries: np.ndarray, duration: float, min_gap: float) -> np.ndarray:
     arr = np.asarray(boundaries, dtype=float)
     arr = arr[np.isfinite(arr)]
